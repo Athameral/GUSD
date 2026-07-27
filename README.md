@@ -27,9 +27,9 @@
 ### Visualization on TJScenes
 
 <p align="center" style="width: 100%; margin-top: 4px;">
-  <span style="display: inline-block; width: 33%; text-align: center;"><b>Ground Truth</b></span>
+  <span style="display: inline-block; width: 33%; text-align: left;"><b>Ground Truth</b></span>
   <span style="display: inline-block; width: 33%; text-align: center;"><b>Gaussians</b></span>
-  <span style="display: inline-block; width: 33%; text-align: center;"><b>Predicted Occupancy</b></span>
+  <span style="display: inline-block; width: 33%; text-align: right;"><b>Predicted Occupancy</b></span>
 <video src="https://github.com/user-attachments/assets/44394e9e-0e62-40fc-b2bb-35d7c86999df" width="100%" autoplay loop muted playsinline></video>
 </p>
 
@@ -37,14 +37,14 @@
 
 <p align="center">
   
-  <span style="display: inline-block; width: 49%; text-align: center;"><b>Ground Truth</b></span>
-  <span style="display: inline-block; width: 49%; text-align: center;"><b>Predicted Occupancy</b></span>
+  <span style="display: inline-block; width: 49%; text-align: left;"><b>Ground Truth</b></span>
+  <span style="display: inline-block; width: 49%; text-align: right;"><b>Predicted Occupancy</b></span>
   
   <video src="https://github.com/user-attachments/assets/e48364de-5e8c-438f-8b01-432d07891a2d" width="100%" autoplay loop muted playsinline></video>
   
  
-  <span style="display: inline-block; width: 49%; text-align: center;"><b>Gaussians @ layer 1st</b></span>
-  <span style="display: inline-block; width: 49%; text-align: center;"><b>Gaussians @ layer 5th</b></span>
+  <span style="display: inline-block; width: 49%; text-align: left;"><b>Gaussians @ layer 1st</b></span>
+  <span style="display: inline-block; width: 49%; text-align: right;"><b>Gaussians @ layer 5th</b></span>
 </p>
 
 
