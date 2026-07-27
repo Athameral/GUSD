@@ -48,8 +48,6 @@
 </p>
 
 
-> **Note:** Here is where you highlight your two visual results! Interactive or dynamic GIFs work best to show depth and resolution.
-
 ---
 
 ## 🔥 Highlights
