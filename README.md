@@ -9,7 +9,7 @@
 
 ---
 
-<img src="docs/01_framework_v4.svg" width="100%" alt="GaussianSeed Demo" style="background-color: white;"/>
+<img src="docs/01_framework_v4.svg" width="100%" alt="GaussianSeed Demo"/>
 
 *The overall architecture of the GaussianSeed framework. At each decoder layer, queries are progressively refined leveraging multi-scale image features. These refined queries are subsequently decoded into 3D Gaussian primitives and rendered into the voxel space, where the dense occupancy ground truth is applied for direct supervision.*
 
@@ -26,32 +26,27 @@
 
 ### Visualization on TJScenes
 
-<table>
-  <tr>
-    <th>Ground Truth</th>
-    <th>Gaussians</th>
-    <th>Predicted Occupancy</th>
-  </tr>
-  <tr>
-    <td colspan="3"><video src="https://github.com/Athameral/GUSD/releases/download/untagged-6d2b1d322741aa1eecfa/tjscenes_gt_gs_pred.mp4" width="100%" autoplay loop muted playsinline></video></td>
-  </tr>
-</table>
+<p align="center" style="width: 100%; margin-top: 4px;">
+  <span style="display: inline-block; width: 33%; text-align: center;"><b>Ground Truth</b></span>
+  <span style="display: inline-block; width: 33%; text-align: center;"><b>Gaussians</b></span>
+  <span style="display: inline-block; width: 33%; text-align: center;"><b>Predicted Occupancy</b></span>
+<video src="https://github.com/Athameral/GUSD/releases/download/untagged-6d2b1d322741aa1eecfa/tjscenes_gt_gs_pred.mp4" width="100%" autoplay loop muted playsinline></video>
+</p>
 
 ### Visualization on Occ3D-nuScenes
 
-<table>
-  <tr>
-    <td>Ground Truth</td>
-    <td>Predicted Occupancy</td>
-  </tr>
-  <tr>
-    <td colspan="2"><video src="https://github.com/Athameral/GUSD/releases/download/untagged-6d2b1d322741aa1eecfa/occ3d_nuscenes_gt_gs_occ_900.mp4" width="100%" autoplay loop muted playsinline></video></td>
-  </tr>
-  <tr>
-    <td>Gaussians @ layer 1st</td>
-    <td>Gaussians @ layer 51st</td>
-  </tr>
-</table>
+<p align="center">
+  
+  <span style="display: inline-block; width: 49%; text-align: center;"><b>Ground Truth</b></span>
+  <span style="display: inline-block; width: 49%; text-align: center;"><b>Predicted Occupancy</b></span>
+  
+  <video src="https://github.com/Athameral/GUSD/releases/download/untagged-6d2b1d322741aa1eecfa/occ3d_nuscenes_gt_gs_occ_900.mp4" width="100%" autoplay loop muted playsinline></video>
+  
+ 
+  <span style="display: inline-block; width: 49%; text-align: center;"><b>Gaussians @ layer 1st</b></span>
+  <span style="display: inline-block; width: 49%; text-align: center;"><b>Gaussians @ layer 5th</b></span>
+</p>
+
 
 > **Note:** Here is where you highlight your two visual results! Interactive or dynamic GIFs work best to show depth and resolution.
 
