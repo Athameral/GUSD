@@ -20,11 +20,14 @@ __global__ void preprocessCUDA(
 }
 
 
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, int TILE_SIZE>
 __global__ void renderCUDA(
 	const int P,
 	const uint32_t* __restrict__ offsets,
 	const uint32_t* __restrict__ point_list_keys_unsorted,
+	const int* __restrict__ means_int,
+	const int* __restrict__ radii,
+	const dim3 grid,
 	const int* __restrict__ voxel2pts,
 	const float* __restrict__ pts,
 	const float* __restrict__ means3D,
@@ -43,7 +46,8 @@ __global__ void renderCUDA(
 	float* __restrict__ semantics_grad,
 	float* __restrict__ cov3D_grad)
 {
-    auto idx = cg::this_grid().thread_rank();
+	const int idx = blockIdx.x;
+	const int lane = threadIdx.x;
 	if (idx >= P)
 	    return;
 
@@ -65,11 +69,30 @@ __global__ void renderCUDA(
 	float semantic_grad[CHANNELS] = {0};
 	float cov_grad[6] = {0};
 
-	for (int i = start; i < end; i++)
+	const int tile_w = (grid.y + TILE_SIZE - 1) / TILE_SIZE;
+	const int tile_d = (grid.z + TILE_SIZE - 1) / TILE_SIZE;
+	for (int i = start + lane; i < end; i += blockDim.x)
 	{
-		int voxel_idx = point_list_keys_unsorted[i];
-		int pts_idx = voxel2pts[voxel_idx];
-		if (pts_idx >= 0)
+		int tile_idx = point_list_keys_unsorted[i];
+		int tz = tile_idx % tile_d;
+		int ty = (tile_idx / tile_d) % tile_w;
+		int tx = tile_idx / (tile_w * tile_d);
+		for (int lx = 0; lx < TILE_SIZE; ++lx)
+		for (int ly = 0; ly < TILE_SIZE; ++ly)
+		for (int lz = 0; lz < TILE_SIZE; ++lz)
+		{
+			int vx = tx * TILE_SIZE + lx;
+			int vy = ty * TILE_SIZE + ly;
+			int vz = tz * TILE_SIZE + lz;
+			if (vx >= grid.x || vy >= grid.y || vz >= grid.z)
+				continue;
+			if (vx < means_int[3 * idx] - radii[3 * idx] || vx > means_int[3 * idx] + radii[3 * idx] ||
+				vy < means_int[3 * idx + 1] - radii[3 * idx + 1] || vy > means_int[3 * idx + 1] + radii[3 * idx + 1] ||
+				vz < means_int[3 * idx + 2] - radii[3 * idx + 2] || vz > means_int[3 * idx + 2] + radii[3 * idx + 2])
+				continue;
+			int voxel_idx = vx * grid.y * grid.z + vy * grid.z + vz;
+			int pts_idx = voxel2pts[voxel_idx];
+			if (pts_idx >= 0)
 		{
 			float3 d = {means.x - pts[pts_idx * 3], means.y - pts[pts_idx * 3 + 1], means.z - pts[pts_idx * 3 + 2]};
 			float power = cov1.x * d.x * d.x + cov1.y * d.y * d.y + cov1.z * d.z * d.z;
@@ -106,19 +129,35 @@ __global__ void renderCUDA(
 			cov_grad[4] += power_grad * power * (- d.y * d.z) + 2 * deter_grad * (cov2.x * cov2.z - cov1.x * cov2.y);
 			cov_grad[5] += power_grad * power * (- d.x * d.z) + 2 * deter_grad * (cov2.x * cov2.y - cov1.y * cov2.z);
 		}
+		}
 	}
 
-	means3D_grad[idx * 3] = means_grad[0];
-	means3D_grad[idx * 3 + 1] = means_grad[1];
-	means3D_grad[idx * 3 + 2] = means_grad[2];
-	opas_grad[idx] = opa_grad;
+	__shared__ float partial[CHANNELS + 10][128];
+	partial[0][lane] = means_grad[0];
+	partial[1][lane] = means_grad[1];
+	partial[2][lane] = means_grad[2];
+	partial[3][lane] = opa_grad;
 	for (int ch = 0; ch < CHANNELS; ch++)
 	{
-		semantics_grad[idx * CHANNELS + ch] = semantic_grad[ch];
+		partial[4 + ch][lane] = semantic_grad[ch];
 	}
 	for (int ch = 0; ch < 6; ch++)
 	{
-		cov3D_grad[idx * 6 + ch] = cov_grad[ch];
+		partial[4 + CHANNELS + ch][lane] = cov_grad[ch];
+	}
+	__syncthreads();
+	for (int stride = 64; stride > 0; stride /= 2) {
+		if (lane < stride) {
+			for (int ch = 0; ch < CHANNELS + 10; ++ch)
+				partial[ch][lane] += partial[ch][lane + stride];
+		}
+		__syncthreads();
+	}
+	if (lane == 0) {
+		for (int ch = 0; ch < 3; ++ch) means3D_grad[idx * 3 + ch] = partial[ch][0];
+		opas_grad[idx] = partial[3][0];
+		for (int ch = 0; ch < CHANNELS; ++ch) semantics_grad[idx * CHANNELS + ch] = partial[4 + ch][0];
+		for (int ch = 0; ch < 6; ++ch) cov3D_grad[idx * 6 + ch] = partial[4 + CHANNELS + ch][0];
 	}
 }
 
@@ -127,6 +166,9 @@ void BACKWARD::render(
 	const int P,
 	const uint32_t* offsets,
 	const uint32_t* point_list_keys_unsorted,
+	const int* means_int,
+	const int* radii,
+	const dim3 grid,
 	const int* voxel2pts,
 	const float* pts,
 	const float* means3D,
@@ -143,29 +185,16 @@ void BACKWARD::render(
 	float* means3D_grad,
 	float* opas_grad,
 	float* semantics_grad,
-	float* cov3D_grad)
+	float* cov3D_grad,
+	const int tile_size)
 {
-	renderCUDA<NUM_LOGITS_CHANNELS> << <(P + 255) / 256, 256 >> > (
-		P,
-		offsets,
-		point_list_keys_unsorted,
-		voxel2pts,
-		pts,
-		means3D,
-		cov3D,
-		opas,
-		semantic,
-		logits,
-		bin_logits,
-		density,
-		probability,
-		logits_grad,
-		bin_logits_grad,
-		density_grad,
-		means3D_grad,
-		opas_grad,
-		semantics_grad,
-		cov3D_grad);
+	#define LAUNCH_BACKWARD(TILE) renderCUDA<NUM_LOGITS_CHANNELS, TILE> <<< P, 128 >>> (P, offsets, point_list_keys_unsorted, means_int, radii, grid, voxel2pts, pts, means3D, cov3D, opas, semantic, logits, bin_logits, density, probability, logits_grad, bin_logits_grad, density_grad, means3D_grad, opas_grad, semantics_grad, cov3D_grad)
+	switch (tile_size) {
+		case 2: LAUNCH_BACKWARD(2); break;
+		case 4: LAUNCH_BACKWARD(4); break;
+		case 8: LAUNCH_BACKWARD(8); break;
+	}
+	#undef LAUNCH_BACKWARD
 }
 
 void BACKWARD::preprocess(

@@ -83,12 +83,11 @@ model = dict(
         gs_seed_scale=False,
         scale_range=[0.01, 0.7],
         cuda_kwargs=dict(
+            tile_size=4,
             scale_multiplier=3,
             H=400, W=400, D=64,
             pc_min=point_cloud_range[:3],
             grid_size=voxel_size[0],
-            # chunk_num=(8, 8, 8),  # H×W×D 切成 2×2×1 块
-            # chunk_margin=10,
         ),
         transformer=dict(
             type='GUSDTransformer',

@@ -80,6 +80,8 @@ pip install -r requirements.txt
 ```
 
 ### 2. Train
+[Renderer configuration and CUDA rebuild instructions](docs/renderer.md)
+
 ```bash
 torchrun --nproc_per_node <your_gpu_number> train.py --config <your_config>
 ```

@@ -59,7 +59,8 @@ __global__ void duplicateWithKeys(
     uint32_t* gaussian_keys_unsorted,
     uint32_t* gaussian_values_unsorted,
     const int* radii,
-    const dim3 grid)
+	const dim3 grid,
+	const int tile_size)
 {
     auto idx = cg::this_grid().thread_rank();
     if (idx >= P)
@@ -68,7 +69,8 @@ __global__ void duplicateWithKeys(
     uint32_t off = (idx == 0) ? 0 : offsets[idx - 1];
     uint3 rect_min, rect_max;
 
-    getRect(points_xyz + 3 * idx, radii + 3 * idx, rect_min, rect_max, grid);
+	getTileRect(points_xyz + 3 * idx, radii + 3 * idx, rect_min, rect_max, grid, tile_size);
+	const dim3 tile_grid((grid.x + tile_size - 1) / tile_size, (grid.y + tile_size - 1) / tile_size, (grid.z + tile_size - 1) / tile_size);
     
     for (int x = rect_min.x; x < rect_max.x; x++)
     {
@@ -76,7 +78,7 @@ __global__ void duplicateWithKeys(
         {
             for (int z = rect_min.z; z < rect_max.z; z++)
             {
-                uint32_t key = x * grid.y * grid.z + y * grid.z + z;
+				uint32_t key = x * tile_grid.y * tile_grid.z + y * tile_grid.z + z;
                 gaussian_keys_unsorted[off] = key;
                 gaussian_values_unsorted[off] = idx;
                 off++;
@@ -169,6 +171,7 @@ int LocalAggregator::Aggregator::forward(
 	float* out_bin_logits,
 	float* out_density,
 	float* out_probability,
+	const int tile_size,
 	bool debug)
 {
 	size_t chunk_size = required<GeometryState>(P);
@@ -176,9 +179,10 @@ int LocalAggregator::Aggregator::forward(
 	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
 
 	// Dynamically resize image-based auxiliary buffers during training
-	size_t img_chunk_size = required<ImageState>(H * W * D);
+	const int tile_count = ((H + tile_size - 1) / tile_size) * ((W + tile_size - 1) / tile_size) * ((D + tile_size - 1) / tile_size);
+	size_t img_chunk_size = required<ImageState>(tile_count);
 	char* img_chunkptr = imageBuffer(img_chunk_size);
-	ImageState imgState = ImageState::fromChunk(img_chunkptr, H * W * D);
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, tile_count);
 
 	dim3 grid(H, W, D);
 
@@ -188,7 +192,8 @@ int LocalAggregator::Aggregator::forward(
 		means3D_int,
 		radii,
 		grid,
-		geomState.tiles_touched
+		geomState.tiles_touched,
+		tile_size
 	), debug)
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
@@ -198,6 +203,7 @@ int LocalAggregator::Aggregator::forward(
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+	TORCH_CHECK(num_rendered >= 0, "Gaussian-tile pair count exceeds signed 32-bit capacity; reduce scales/count or increase tile_size");
 
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
@@ -212,7 +218,8 @@ int LocalAggregator::Aggregator::forward(
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
 		radii,
-		grid)
+		grid,
+		tile_size)
 	CHECK_CUDA(, debug);
 
 	// int bit = getHigherMsb(H * W * D);
@@ -226,7 +233,7 @@ int LocalAggregator::Aggregator::forward(
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 32 + bit), debug)
 
-	CHECK_CUDA(cudaMemset(imgState.ranges, 0, H * W * D * sizeof(uint2)), debug);
+	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_count * sizeof(uint2)), debug);
 
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
@@ -251,7 +258,10 @@ int LocalAggregator::Aggregator::forward(
 		out_logits,
 		out_bin_logits,
 		out_density,
-		out_probability), debug);
+		out_probability,
+		means3D_int,
+		radii,
+		tile_size), debug);
 	
 	// return num_rendered;
 	return num_rendered;
@@ -266,6 +276,8 @@ void LocalAggregator::Aggregator::backward(
 	char* binning_buffer,
 	char* img_buffer,
 	const int* points_int,
+	const int* means3D_int,
+	const int* radii,
 	int* voxel2pts,
 	const float* pts,
 	const float* means3D,
@@ -283,11 +295,13 @@ void LocalAggregator::Aggregator::backward(
 	float* opas_grad,
 	float* semantics_grad,
 	float* cov3D_grad,
+	const int tile_size,
 	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
-	ImageState imgState = ImageState::fromChunk(img_buffer, H * W * D);
+	const int tile_count = ((H + tile_size - 1) / tile_size) * ((W + tile_size - 1) / tile_size) * ((D + tile_size - 1) / tile_size);
+	ImageState imgState = ImageState::fromChunk(img_buffer, tile_count);
 
 	const dim3 grid(H, W, D);
 
@@ -305,6 +319,9 @@ void LocalAggregator::Aggregator::backward(
 		P,
 		geomState.point_offsets,
 		binningState.point_list_keys_unsorted,
+		means3D_int,
+		radii,
+		grid,
 		voxel2pts,
 		pts,
 		means3D,
@@ -321,5 +338,6 @@ void LocalAggregator::Aggregator::backward(
 		means3D_grad,
 		opas_grad,
 		semantics_grad,
-		cov3D_grad), debug)
+		cov3D_grad,
+		tile_size), debug)
 }

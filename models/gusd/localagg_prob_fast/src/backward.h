@@ -24,6 +24,9 @@ namespace BACKWARD
         const int P,
         const uint32_t* offsets,
         const uint32_t* point_list_keys_unsorted,
+        const int* means_int,
+        const int* radii,
+        const dim3 grid,
         const int* voxel2pts,
         const float* pts,
         const float* means3D,
@@ -40,7 +43,8 @@ namespace BACKWARD
         float* means3D_grad,
         float* opas_grad,
         float* semantics_grad,
-        float* cov3D_grad);
+        float* cov3D_grad,
+        const int tile_size);
 
 	void preprocess(
         const int N,

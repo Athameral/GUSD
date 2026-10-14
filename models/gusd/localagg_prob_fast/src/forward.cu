@@ -11,7 +11,8 @@ __global__ void preprocessCUDA(
 	const int* points_xyz,
 	const int* radii,
 	const dim3 grid,
-	uint32_t* tiles_touched)
+	uint32_t* tiles_touched,
+	const int tile_size)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -20,7 +21,7 @@ __global__ void preprocessCUDA(
 	tiles_touched[idx] = 0;
 
 	uint3 rect_min, rect_max;
-	getRect(points_xyz + 3 * idx, radii + 3 * idx, rect_min, rect_max, grid);
+	getTileRect(points_xyz + 3 * idx, radii + 3 * idx, rect_min, rect_max, grid, tile_size);
 	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) * (rect_max.z - rect_min.z) == 0)
 		return;
 
@@ -31,7 +32,7 @@ __global__ void preprocessCUDA(
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, int TILE_SIZE>
 __global__ void renderCUDA(
 	const int N,
 	const float* __restrict__ pts,
@@ -46,14 +47,18 @@ __global__ void renderCUDA(
 	float* __restrict__ out_logits,
 	float* __restrict__ out_bin_logits,
 	float* __restrict__ out_density,
-	float* __restrict__ out_probability)
+	float* __restrict__ out_probability,
+	const int* __restrict__ means_int,
+	const int* __restrict__ radii)
 {
     auto idx = cg::this_grid().thread_rank();
 	if (idx >= N)
 	    return;
 
 	const int* point_int = points_int + idx * 3;
-	const int voxel_idx = point_int[0] * grid.y * grid.z + point_int[1] * grid.z + point_int[2];
+	const int tile_w = (grid.y + TILE_SIZE - 1) / TILE_SIZE;
+	const int tile_d = (grid.z + TILE_SIZE - 1) / TILE_SIZE;
+	const int voxel_idx = (point_int[0] / TILE_SIZE) * tile_w * tile_d + (point_int[1] / TILE_SIZE) * tile_d + point_int[2] / TILE_SIZE;
 	const float3 point = {pts[3 * idx], pts[3 * idx + 1], pts[3 * idx + 2]};
 
 	// Load start/end range of IDs to process in bit sorted list.
@@ -68,6 +73,13 @@ __global__ void renderCUDA(
 	for (int i = range.x; i < range.y; i++)
 	{
 		int gs_idx = point_list[i];
+		bool inside = true;
+		for (int axis = 0; axis < 3; ++axis) {
+			const int center = means_int[3 * gs_idx + axis];
+			const int radius = radii[3 * gs_idx + axis];
+			inside = inside && point_int[axis] >= center - radius && point_int[axis] <= center + radius;
+		}
+		if (!inside) continue;
 		float3 cov1 = { cov3D[gs_idx * 6 + 0], cov3D[gs_idx * 6 + 1], cov3D[gs_idx * 6 + 2] };
 		float3 cov2 = { cov3D[gs_idx * 6 + 3], cov3D[gs_idx * 6 + 4], cov3D[gs_idx * 6 + 5] };
 		float3 d = { means3D[gs_idx * 3] - point.x, means3D[gs_idx * 3 + 1] - point.y, means3D[gs_idx * 3 + 2] - point.z };
@@ -116,38 +128,34 @@ void FORWARD::render(
 	float* out_logits,
 	float* out_bin_logits,
 	float* out_density,
-	float* out_probability)
+	float* out_probability,
+	const int* means_int,
+	const int* radii,
+	const int tile_size)
 {
-	renderCUDA<NUM_LOGITS_CHANNELS> << <(N + 255) / 256, 256 >> > (
-		N, 
-		pts,
-		points_int,
-		grid,
-		ranges,
-		point_list,
-		means3D,
-		cov3D,
-		opas,
-		semantic,
-		out_logits,
-		out_bin_logits,
-		out_density,
-		out_probability);
+	#define LAUNCH_FORWARD(TILE) renderCUDA<NUM_LOGITS_CHANNELS, TILE> <<< (N + 255) / 256, 256 >>> (N, pts, points_int, grid, ranges, point_list, means3D, cov3D, opas, semantic, out_logits, out_bin_logits, out_density, out_probability, means_int, radii)
+	switch (tile_size) {
+		case 2: LAUNCH_FORWARD(2); break;
+		case 4: LAUNCH_FORWARD(4); break;
+		case 8: LAUNCH_FORWARD(8); break;
+	}
+	#undef LAUNCH_FORWARD
 }
-
 
 void FORWARD::preprocess(
 	const int P,
 	const int* points_xyz,
 	const int* radii,
 	const dim3 grid,
-	uint32_t* tiles_touched)
+	uint32_t* tiles_touched,
+	const int tile_size)
 {
 	preprocessCUDA << <(P + 255) / 256, 256 >> > (
 		P,
 		points_xyz,
 		radii,
 		grid,
-		tiles_touched
+		tiles_touched,
+		tile_size
 	);
 }

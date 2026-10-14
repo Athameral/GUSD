@@ -42,8 +42,9 @@ LocalAggregateCUDA(
 	const torch::Tensor& semantics,      // g, c
 	const torch::Tensor& radii,          // g
 	const torch::Tensor& cov3D,          // g, 6
-	const int H, int W, int D)
+	const int H, int W, int D, const int tile_size)
 {
+    TORCH_CHECK(tile_size == 2 || tile_size == 4 || tile_size == 8, "tile_size must be 2, 4 or 8");
   
 	const int P = means3D.size(0);
 	const int N = pts.size(0);
@@ -83,7 +84,8 @@ LocalAggregateCUDA(
 		out_logits.contiguous().data<float>(),
 		out_bin_logits.contiguous().data<float>(),
 		out_density.contiguous().data<float>(),
-		out_probability.contiguous().data<float>());
+		out_probability.contiguous().data<float>(),
+		tile_size);
 	
 	return std::make_tuple(rendered, out_logits, out_bin_logits, out_density, out_probability, geomBuffer, binningBuffer, imgBuffer);
 }
@@ -98,6 +100,8 @@ LocalAggregateBackwardCUDA(
 	const torch::Tensor& means3D,
 	const torch::Tensor& pts,
 	const torch::Tensor& points_int,
+	const torch::Tensor& means3D_int,
+	const torch::Tensor& radii,
 	const torch::Tensor& cov3D,
 	const torch::Tensor& opas,
 	const torch::Tensor& semantics,
@@ -107,8 +111,10 @@ LocalAggregateBackwardCUDA(
 	const torch::Tensor& probability,
 	const torch::Tensor& logits_grad,
 	const torch::Tensor& bin_logits_grad,
-	const torch::Tensor& density_grad) 
+	const torch::Tensor& density_grad,
+	const int tile_size)
 {
+    TORCH_CHECK(tile_size == 2 || tile_size == 4 || tile_size == 8, "tile_size must be 2, 4 or 8");
 	const int P = means3D.size(0);
 	const int N = pts.size(0);
 	
@@ -126,6 +132,8 @@ LocalAggregateBackwardCUDA(
 		reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
 		reinterpret_cast<char*>(imageBuffer.contiguous().data_ptr()),
         points_int.contiguous().data<int>(),
+		means3D_int.contiguous().data<int>(),
+		radii.contiguous().data<int>(),
 		voxel2pts.contiguous().data<int>(),
 		pts.contiguous().data<float>(),
 		means3D.contiguous().data<float>(),
@@ -142,7 +150,8 @@ LocalAggregateBackwardCUDA(
 		means3D_grad.contiguous().data<float>(),
 		opas_grad.contiguous().data<float>(),
 		semantics_grad.contiguous().data<float>(),
-		cov3D_grad.contiguous().data<float>());
+		cov3D_grad.contiguous().data<float>(),
+		tile_size);
 
 	return std::make_tuple(means3D_grad, opas_grad, semantics_grad, cov3D_grad);
 }

@@ -41,6 +41,7 @@ namespace LocalAggregator
 			float* out_bin_logits,
 			float* out_density,
 			float* out_probability,
+			const int tile_size,
 			bool debug = false);
 
 		static void backward(
@@ -50,6 +51,8 @@ namespace LocalAggregator
 			char* binning_buffer,
 			char* img_buffer,
 			const int* points_int,
+			const int* means3D_int,
+			const int* radii,
 			int* voxel2pts,
 			const float* pts,
 			const float* means3D,
@@ -67,6 +70,7 @@ namespace LocalAggregator
 			float* opas_grad,
 			float* semantics_grad,
 			float* cov3D_grad,
+			const int tile_size,
 			bool debug = false);
 	};
 };

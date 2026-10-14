@@ -80,6 +80,7 @@ model = dict(
         # Gaussian Splatting Parameters
         scale_range=[0.01, 2.4],
         cuda_kwargs=dict(
+            tile_size=4,
             scale_multiplier=3,
             H=200, W=200, D=16,
             pc_min=point_cloud_range[:3],

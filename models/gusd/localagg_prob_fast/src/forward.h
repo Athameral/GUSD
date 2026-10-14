@@ -26,7 +26,8 @@ namespace FORWARD
         const int* points_xyz,
         const int* radii,
         const dim3 grid,
-        uint32_t* tiles_touched);
+        uint32_t* tiles_touched,
+        const int tile_size);
 
 	// Main rasterization method.
 	void render(
@@ -43,7 +44,10 @@ namespace FORWARD
         float* out_logits,
         float* out_bin_logits,
         float* out_density,
-        float* out_probability);
+        float* out_probability,
+        const int* means_int,
+        const int* radii,
+        const int tile_size);
 }
 
 

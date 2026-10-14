@@ -25,7 +25,7 @@ LocalAggregateCUDA(
 	const torch::Tensor& semantics,      // g, c
 	const torch::Tensor& radii,          // g
 	const torch::Tensor& cov3D,          // g, 6
-	const int H, int W, int D);
+	const int H, int W, int D, const int tile_size);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 LocalAggregateBackwardCUDA(
@@ -37,6 +37,8 @@ LocalAggregateBackwardCUDA(
 	const torch::Tensor& means3D,
 	const torch::Tensor& pts,
 	const torch::Tensor& points_int,
+	const torch::Tensor& means3D_int,
+	const torch::Tensor& radii,
 	const torch::Tensor& cov3D,
 	const torch::Tensor& opas,
 	const torch::Tensor& semantics,
@@ -46,4 +48,5 @@ LocalAggregateBackwardCUDA(
 	const torch::Tensor& probability,
 	const torch::Tensor& logits_grad,
 	const torch::Tensor& bin_logits_grad,
-	const torch::Tensor& density_grad);
+	const torch::Tensor& density_grad,
+	const int tile_size);

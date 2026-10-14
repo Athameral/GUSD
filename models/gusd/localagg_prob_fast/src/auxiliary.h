@@ -19,6 +19,13 @@ __forceinline__ __device__ void getRect(const int* p, const int* radius, uint3& 
 	};
 }
 
+__forceinline__ __device__ void getTileRect(const int* p, const int* radius, uint3& lo, uint3& hi, dim3 grid, int tile_size)
+{
+	getRect(p, radius, lo, hi, grid);
+	lo = {lo.x / tile_size, lo.y / tile_size, lo.z / tile_size};
+	hi = {(hi.x + tile_size - 1) / tile_size, (hi.y + tile_size - 1) / tile_size, (hi.z + tile_size - 1) / tile_size};
+}
+
 #define CHECK_CUDA(A, debug) \
 A; if(debug) { \
 auto ret = cudaDeviceSynchronize(); \

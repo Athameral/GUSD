@@ -108,8 +108,9 @@ def sampling_4d(sample_points, mlvl_feats, scale_weights, occ2img, image_h, imag
 
     # reorganize the tensor to stack T and G to the batch dim for better parallelism
     scale_weights = scale_weights.reshape(B, Q, G, T, P, -1)
-    scale_weights = scale_weights.permute(0, 2, 3, 1, 4, 5)
-    scale_weights = scale_weights.reshape(B*G*T, Q, P, -1)
+    # Match feature/location batch order [B, T, G], not [B, G, T].
+    scale_weights = scale_weights.permute(0, 3, 2, 1, 4, 5)
+    scale_weights = scale_weights.reshape(B*T*G, Q, P, -1)
     scale_weights = scale_weights.contiguous()
 
     # multi-scale multi-view grid sample

@@ -19,61 +19,25 @@ from ..utils import _unravel_index
 
 
 def get_rotation_matrix(tensor):
-    """四元数 → 旋转矩阵 3x3 (来自 GaussianFormer model/utils/utils.py)
-    
-    Args:
-        tensor: (..., 4) — 四元数 quaternion (w, x, y, z)
-    Returns:
-        R_3x3: (..., 3, 3)
+    """Convert scalar-first (w, x, y, z) quaternions to local-to-world rotations.
+
+    An all-zero quaternion falls back to identity. This agrees with the
+    GaussianFormer quaternion convention without allocating 4x4 matrices.
     """
     assert tensor.shape[-1] == 4
 
-    tensor = F.normalize(tensor, dim=-1)
-    mat1 = torch.zeros(*tensor.shape[:-1], 4, 4, dtype=tensor.dtype, device=tensor.device)
-    mat1[..., 0, 0] = tensor[..., 0]
-    mat1[..., 0, 1] = - tensor[..., 1]
-    mat1[..., 0, 2] = - tensor[..., 2]
-    mat1[..., 0, 3] = - tensor[..., 3]
-
-    mat1[..., 1, 0] = tensor[..., 1]
-    mat1[..., 1, 1] = tensor[..., 0]
-    mat1[..., 1, 2] = - tensor[..., 3]
-    mat1[..., 1, 3] = tensor[..., 2]
-
-    mat1[..., 2, 0] = tensor[..., 2]
-    mat1[..., 2, 1] = tensor[..., 3]
-    mat1[..., 2, 2] = tensor[..., 0]
-    mat1[..., 2, 3] = - tensor[..., 1]
-
-    mat1[..., 3, 0] = tensor[..., 3]
-    mat1[..., 3, 1] = - tensor[..., 2]
-    mat1[..., 3, 2] = tensor[..., 1]
-    mat1[..., 3, 3] = tensor[..., 0]
-
-    mat2 = torch.zeros(*tensor.shape[:-1], 4, 4, dtype=tensor.dtype, device=tensor.device)
-    mat2[..., 0, 0] = tensor[..., 0]
-    mat2[..., 0, 1] = - tensor[..., 1]
-    mat2[..., 0, 2] = - tensor[..., 2]
-    mat2[..., 0, 3] = - tensor[..., 3]
-
-    mat2[..., 1, 0] = tensor[..., 1]
-    mat2[..., 1, 1] = tensor[..., 0]
-    mat2[..., 1, 2] = tensor[..., 3]
-    mat2[..., 1, 3] = - tensor[..., 2]
-
-    mat2[..., 2, 0] = tensor[..., 2]
-    mat2[..., 2, 1] = - tensor[..., 3]
-    mat2[..., 2, 2] = tensor[..., 0]
-    mat2[..., 2, 3] = tensor[..., 1]
-
-    mat2[..., 3, 0] = tensor[..., 3]
-    mat2[..., 3, 1] = tensor[..., 2]
-    mat2[..., 3, 2] = - tensor[..., 1]
-    mat2[..., 3, 3] = tensor[..., 0]
-
-    R_4x4 = torch.matmul(mat1, mat2)  # (..., 4, 4)
-    R_3x3 = R_4x4[..., :3, :3]  # (..., 3, 3)
-    return R_3x3
+    norm = torch.linalg.vector_norm(tensor, dim=-1, keepdim=True)
+    identity_quaternion = torch.zeros_like(tensor)
+    identity_quaternion[..., 0] = 1
+    tensor = torch.where(norm > 1e-12, tensor / norm.clamp_min(1e-12),
+                         identity_quaternion)
+    w, x, y, z = tensor.unbind(-1)
+    entries = (
+        1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+    )
+    return torch.stack(entries, dim=-1).reshape(*tensor.shape[:-1], 3, 3)
 
 
 @HEADS.register_module()
@@ -297,23 +261,17 @@ class GUSDHead(BaseModule):
                 rotations = torch.where(
                     needs_reset[..., None], id_quat, rotations)
 
-        # 6. 构建协方差逆矩阵 CovInv
-        S = torch.zeros(B, G, 3, 3, dtype=scales.dtype, device=scales.device)
-        S[..., 0, 0] = scales[..., 0]
-        S[..., 1, 1] = scales[..., 1]
-        S[..., 2, 2] = scales[..., 2]
-        R = get_rotation_matrix(rotations)  # (B, G, 3, 3)
-        M = torch.matmul(S, R)              # (B, G, 3, 3)
-        Cov = torch.matmul(M.transpose(-1, -2), M)  # (B, G, 3, 3)
-        # 按 scale 比例加 jitter，避免大 scale 下协方差矩阵接近奇异 → pinv 出 NaN
-        # jitter = max(1e-3, scale_max * 0.01)，即 jitter 随 scale 自适应增长
-        diag_jitter = torch.clamp(scales.detach().amax(dim=-1, keepdim=True) * 0.01, min=1e-3)  # (B, G, 1)
-        diag_jitter = diag_jitter.unsqueeze(-1)  # (B, G, 1, 1)
-        I = torch.eye(3, device=Cov.device).view(1, 1, 3, 3)
-        Cov_stable = Cov + diag_jitter * I
-        # L = torch.linalg.cholesky(Cov_stable)
-        # CovInv = torch.cholesky_inverse(L)  # (B, G, 3, 3)
-        CovInv = torch.linalg.pinv(Cov_stable, rcond=1e-5)  # (B, G, 3, 3)
+        # 6. Analytic SPD covariance/inverse, evaluated in FP32.
+        # R maps local axes to world axes: Cov = R diag(variance) R^T.
+        # Preserve the existing detached jitter (variance, m^2); removing pinv
+        # does not by itself stabilize the determinant arithmetic in CUDA.
+        scales = scales.float()
+        R = get_rotation_matrix(rotations.float())
+        diag_jitter = (scales.detach().amax(dim=-1, keepdim=True) * 0.01).clamp_min(1e-3)
+        variance = scales.square() + diag_jitter
+        with torch.autocast(device_type='cuda', enabled=False):
+            Cov_stable = torch.matmul(R * variance.unsqueeze(-2), R.transpose(-1, -2))
+            CovInv = torch.matmul(R * variance.reciprocal().unsqueeze(-2), R.transpose(-1, -2))
 
         return means, origi_opa, opacities, scales, Cov_stable, CovInv
 
