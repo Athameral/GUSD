@@ -1,8 +1,5 @@
-import time
 import queue
 import torch
-import numpy as np
-from tqdm import tqdm
 import numpy as np
 from mmcv.runner import force_fp32, auto_fp16
 from mmcv.runner import get_dist_info
@@ -224,13 +221,9 @@ class GUSD(MVXTwoStageDetector):
             return self.pts_bbox_head.get_gaussians(outs, img_metas[0], rescale=rescale)
 
     def simple_test_online(self, img_metas, img=None, rescale=False):
-        WARMUP_ITERS = 10
-        REPORT_EVERY = 50
-        if not hasattr(self, '_timer_warmed_up'):
-            self._timer_warmed_up = False
-            self._timer_cursor = 0
-            self._timer_window = []
-
+        # NOTE: latency is measured externally (see scripts/timing.py and
+        # val.py --latency) with wall-clock time wrapping the whole
+        # forward pass, so that it is consistent with OPUS.
         self.fp16_enabled = True
         assert len(img_metas) == 1  # batch_size = 1
 
@@ -247,12 +240,6 @@ class GUSD(MVXTwoStageDetector):
         img_metas[0]['pad_shape'] = [img_shape for _ in range(len(img_filenames))]
 
         img_feats_list, img_metas_list = [], []
-
-        # --- timing: start right before backbone, with sync to flush prior CUDA work ---
-        torch.cuda.synchronize()
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
 
         # extract feature frame by frame
         for i in range(num_frames):
@@ -308,30 +295,6 @@ class GUSD(MVXTwoStageDetector):
 
         # run occupancy predictor
         outs = self.pts_bbox_head(img_feats, img_metas)
-
-        end.record()
-        torch.cuda.synchronize()
-        dt = start.elapsed_time(end)
-
-        if not self._timer_warmed_up:
-            self._timer_cursor += 1
-            if self._timer_cursor == WARMUP_ITERS:
-                self._timer_warmed_up = True
-                self._timer_cursor = 0
-                self._timer_window.clear()
-                tqdm.write(f'[Latency] warmup done ({WARMUP_ITERS} iters)')
-        else:
-            self._timer_cursor += 1
-            self._timer_window.append(dt)
-            if self._timer_cursor % REPORT_EVERY == 0:
-                arr = torch.tensor(self._timer_window[-REPORT_EVERY:])
-                tqdm.write(
-                    f'[Latency] n={self._timer_cursor:5d}  '
-                    f'avg={arr.mean().item():.1f}  '
-                    f'min={arr.min().item():.1f}  '
-                    f'max={arr.max().item():.1f}  ms'
-                )
-            
 
         if not self.return_gs:
             return self.pts_bbox_head.get_occ(outs, img_metas[0], rescale=rescale)

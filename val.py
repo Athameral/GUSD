@@ -1,5 +1,6 @@
 import os
 import utils
+import time
 import logging
 import argparse
 import importlib
@@ -49,6 +50,46 @@ def evaluate(dataset, results, epoch, offset=0):
     # }
 
 
+def latency_test(model, data_loader, num_warmup=10, samples=500, log_interval=50):
+    """Measure end-to-end latency by wrapping the whole forward pass with
+    wall-clock time (same protocol as OPUS/scripts/timing.py).
+
+    The measured window covers dataloader->GPU scatter, feature extraction,
+    occupancy head and the occupancy/gaussian post-processing, i.e. the full
+    ``model(...)`` call.
+    """
+    model.eval()
+    times = []
+    with torch.no_grad():
+        for i, data in enumerate(data_loader):
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+
+            model(return_loss=False, rescale=True, **data)
+
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - start_time
+
+            if i >= num_warmup:
+                times.append(elapsed)
+
+            if (i + 1) % log_interval == 0:
+                logging.info('[Latency] done %d/%d' % (i + 1, samples))
+            if (i + 1) >= samples:
+                break
+
+    if not times:
+        logging.info('[Latency] no samples measured (num_warmup >= samples).')
+        return
+
+    arr = torch.tensor(times) * 1000.0
+    logging.info(
+        '[Latency] FINAL (n=%d, warmup=%d)  '
+        'avg=%.1fms  min=%.1fms  max=%.1fms  fps=%.1f'
+        % (len(times), num_warmup, arr.mean().item(), arr.min().item(),
+           arr.max().item(), 1000.0 / arr.mean().item()))
+
+
 def main():
     parser = argparse.ArgumentParser(description='Validate a detector')
     parser.add_argument('--config', required=True)
@@ -59,6 +100,8 @@ def main():
     parser.add_argument('--no_stream_eval', action='store_true')
     parser.add_argument('--offset', type=int, default=0, help='eval with GT at pred_idx + offset (for copy-paste evaluation)')
     parser.add_argument('--latency', action='store_true', help='latency measurement mode: no eval, no streaming, single GPU')
+    parser.add_argument('--num_warmup', type=int, default=10, help='warmup iters for latency measurement')
+    parser.add_argument('--samples', type=int, default=500, help='number of samples used for latency measurement')
     args = parser.parse_args()
 
     # latency mode: force single GPU, no DDP
@@ -144,6 +187,10 @@ def main():
     if world_size > 1:
         results = multi_gpu_test(model, val_loader, gpu_collect=False)
         eval_thread = None
+    elif args.latency:
+        latency_test(model, val_loader, num_warmup=args.num_warmup, samples=args.samples)
+        logging.info('[Latency] measurement done, skipping eval.')
+        return
     else:
         if not args.no_stream_eval:
             results, eval_thread = single_gpu_test_streaming(model, val_loader, data_size=len(val_dataset), local_rank=local_rank)
@@ -154,23 +201,11 @@ def main():
             eval_thread = None
 
     if local_rank == 0:
-        if args.latency:
-            timer_window = getattr(model.module, '_timer_window', [])
-            if timer_window:
-                arr = torch.tensor(timer_window)
-                logging.info(
-                    f'[Latency] FINAL (n={len(timer_window)})  '
-                    f'avg={arr.mean().item():.1f}ms  '
-                    f'min={arr.min().item():.1f}ms  '
-                    f'max={arr.max().item():.1f}ms'
-                )
-            logging.info('[Latency] measurement done, skipping eval.')
-        else:
-            try:
-                evaluate(val_dataset, results, -1, offset=args.offset)
-            finally:
-                if eval_thread is not None:
-                    eval_thread.join()
+        try:
+            evaluate(val_dataset, results, -1, offset=args.offset)
+        finally:
+            if eval_thread is not None:
+                eval_thread.join()
 
 
 if __name__ == '__main__':
