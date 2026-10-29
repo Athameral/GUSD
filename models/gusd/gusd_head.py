@@ -590,7 +590,32 @@ class GUSDHead(BaseModule):
         return loss_gs
     
     def _select_topk_occupied(self, bin_logits: torch.Tensor):
+        """选择占用体素, 两条路径:
+
+        注意: self.test_cfg 由 mvx_two_stage 用 test_cfg['pts'] 注入,
+        因此配置里的 score_thr / score_topk 都写在 detector 的 test_cfg.pts 下。
+
+        1. test_cfg.pts 配置了 score_thr (分数阈值) 时:
+           直接用 bin_logits > score_thr 筛选占用体素 (数量不固定)。
+        2. 否则用 score_topk (topk) 筛选固定数量的占用体素 (原逻辑)。
+
+        Returns:
+            kth_thresh:   (B, 1) — 生效阈值 (score_thr 或 topk 的第 k 大分数)
+            occupied_idx: list of (K_b, 3) — 每个 batch 的占用体素索引 [x, y, z]
+                          (阈值路径下各 batch 的 K_b 可以不同)
+        """
         B, _, X, Y, Z = bin_logits.shape
+
+        # ---- 路径 1: 分数阈值 ----
+        score_thr = self.test_cfg.get('score_thr', None)
+        if score_thr is not None:
+            # print(f'Using score_thr={score_thr} to select occupied voxels.')
+            occupied_masks = bin_logits.squeeze(1) > float(score_thr)  # (B, X, Y, Z)
+            kth_thresh = bin_logits.new_full((B, 1), float(score_thr))
+            occupied_idx = [m.nonzero(as_tuple=False) for m in occupied_masks]
+            return kth_thresh, occupied_idx
+
+        # ---- 路径 2: topk (原逻辑) ----
         bin_logits_topk, occupied_idx = torch.topk(
             bin_logits.flatten(start_dim=1),
             k=self.test_cfg.get('score_topk', 76800)
@@ -598,7 +623,7 @@ class GUSDHead(BaseModule):
         # (B, K), (B, K)
         kth_thresh = bin_logits_topk[:, -1:]  # (B, 1)
         occupied_idx = _unravel_index(occupied_idx, (X, Y, Z))  # (B, K, 3)
-        return kth_thresh, occupied_idx
+        return kth_thresh, [occupied_idx[b] for b in range(B)]
 
     # ========================================================================
     # 构建 GS loss 输入 (适配 OccupancyLoss / MultiLoss 接口)
@@ -865,15 +890,18 @@ class GUSDHead(BaseModule):
         # 1. 语义: argmax → (B, X, Y, Z)
         semantics = rendered_occ.argmax(dim=1)
 
-        # 2. TopK 占用过滤 → 构建 dense occ
+        # 2. TopK / 分数阈值 占用过滤 → 构建 dense occ
         kth_thresh, occupied_idx = self._select_topk_occupied(bin_logits)
         dense_occ = torch.full(
             (batch_size, X, Y, Z), self.empty_label,
             dtype=torch.long, device=rendered_occ.device)
         for b in range(batch_size):
-            x = occupied_idx[b, :, 0].long()
-            y = occupied_idx[b, :, 1].long()
-            z = occupied_idx[b, :, 2].long()
+            idx_b = occupied_idx[b]  # (K, 3) — 阈值路径下各 batch K 可不同
+            if idx_b.numel() == 0:
+                continue
+            x = idx_b[:, 0].long()
+            y = idx_b[:, 1].long()
+            z = idx_b[:, 2].long()
             dense_occ[b, x, y, z] = semantics[b, x, y, z]
 
         if self.test_cfg.get('padding', True):
