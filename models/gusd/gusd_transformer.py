@@ -10,6 +10,7 @@ from mmdet.models.utils.builder import TRANSFORMER
 from ..bbox.utils import decode_bbox, decode_points, encode_points
 from ..utils import inverse_sigmoid, DUMP
 from .gusd_sampling import sampling_4d
+from .hierarchy import GaussianHierarchy, slot_forward
 from ..checkpoint import checkpoint as cp
 from ..csrc.wrapper import MSMV_CUDA
 
@@ -30,7 +31,11 @@ class GUSDTransformer(BaseModule):
                  scales=[1.0],
                  pc_range=[],
                  output_all_gs=False,
-                 use_gs_param_encoder=True,
+                 use_gs_param_encoder=False,
+                 use_explicit_parent=True,
+                 use_node_hidden=True,
+                 sibling_attention_mode="sibling_only",
+                 group_readout_mode="cross_attention",
                  debug=False,
                  init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
@@ -49,6 +54,8 @@ class GUSDTransformer(BaseModule):
             embed_dims, num_frames, num_views, num_points, num_layers, num_levels,
             num_refines, num_groups, num_pt_channels, num_classes, scales, pc_range=pc_range,
             output_all_gs=output_all_gs, use_gs_param_encoder=use_gs_param_encoder,
+            use_explicit_parent=use_explicit_parent, use_node_hidden=use_node_hidden,
+            sibling_attention_mode=sibling_attention_mode, group_readout_mode=group_readout_mode,
             debug=debug)
 
     @torch.no_grad()
@@ -87,7 +94,11 @@ class GUSDTransformerDecoder(BaseModule):
                  scales=[1.0],
                  pc_range=[],
                  output_all_gs=False,
-                 use_gs_param_encoder=True,
+                 use_gs_param_encoder=False,
+                 use_explicit_parent=True,
+                 use_node_hidden=True,
+                 sibling_attention_mode="sibling_only",
+                 group_readout_mode="cross_attention",
                  debug=False,
                  init_cfg=None):
         super().__init__(init_cfg)
@@ -104,7 +115,14 @@ class GUSDTransformerDecoder(BaseModule):
             num_refines = [num_refines]
         if len(num_refines) == 1:
             num_refines = num_refines * num_layers
+        if len(num_refines) != num_layers or len(scales) != num_layers:
+            raise ValueError("num_refines and scales must match num_layers")
         before_refines = [1] + num_refines
+        self.use_node_hidden = use_node_hidden
+        if use_node_hidden:
+            self.root_proj = nn.Linear(embed_dims, embed_dims)
+            self.root_embed = nn.Parameter(torch.zeros(embed_dims))
+            self.root_norm = nn.LayerNorm(embed_dims)
 
         # params are shared across all decoder layers
         self.decoder_layers = ModuleList()
@@ -116,7 +134,10 @@ class GUSDTransformerDecoder(BaseModule):
                     num_groups, num_pt_channels, num_refines[i], before_refines[i],
                     num_classes=num_classes,
                     last_layer=i==num_layers-1, scale=scales[i], pc_range=pc_range,
-                    output_all_gs=output_all_gs, use_gs_param_encoder=use_gs_param_encoder)
+                    output_all_gs=output_all_gs, use_gs_param_encoder=use_gs_param_encoder,
+                    use_explicit_parent=use_explicit_parent, use_node_hidden=use_node_hidden,
+                    sibling_attention_mode=sibling_attention_mode,
+                    group_readout_mode=group_readout_mode)
             )
 
     @torch.no_grad()
@@ -150,12 +171,16 @@ class GUSDTransformerDecoder(BaseModule):
 
             mlvl_feats[lvl] = feat.contiguous()
 
+        node_feat = None
         for i, decoder_layer in enumerate(self.decoder_layers):
             DUMP.stage_count = i
 
             query_points = query_points.detach()
-            query_feat, cls_score, query_points = decoder_layer(
-                query_points, query_feat, mlvl_feats, occ2img, img_metas)
+            if node_feat is None:
+                node_feat = (self.root_norm(self.root_proj(query_feat) + self.root_embed)
+                             if self.use_node_hidden else query_feat).unsqueeze(2)
+            query_feat, node_feat, cls_score, query_points = decoder_layer(
+                query_points, query_feat, node_feat, mlvl_feats, occ2img, img_metas)
 
             cls_scores.append(cls_score)
             refine_pts.append(query_points)
@@ -181,7 +206,11 @@ class GUSDTransformerDecoderLayer(BaseModule):
                  scale=1.0,
                  pc_range=[],
                  output_all_gs=False,
-                 use_gs_param_encoder=True,
+                 use_gs_param_encoder=False,
+                 use_explicit_parent=True,
+                 use_node_hidden=True,
+                 sibling_attention_mode="sibling_only",
+                 group_readout_mode="cross_attention",
                  init_cfg=None):
         super().__init__(init_cfg)
 
@@ -194,6 +223,11 @@ class GUSDTransformerDecoderLayer(BaseModule):
         self.scale = scale
         self.num_classes = num_classes
         self.output_all_gs = output_all_gs
+        self.use_explicit_parent = use_explicit_parent
+        self.hierarchy = GaussianHierarchy(
+            embed_dims, last_refines, num_refines, use_node_hidden=use_node_hidden,
+            sibling_attention_mode=sibling_attention_mode,
+            group_readout_mode="none" if last_layer else group_readout_mode)
 
         # Gaussian attribute dimensions
         self.ga_scale_dim = 3       # scale x, y, z
@@ -269,11 +303,14 @@ class GUSDTransformerDecoderLayer(BaseModule):
         points_delta = points_delta.reshape(B, Q, self.num_refines, 3)
 
         points_proposal = decode_points(points_proposal, self.pc_range)
-        points_proposal = points_proposal.mean(dim=2, keepdim=True)
+        if self.use_explicit_parent:
+            points_proposal = points_proposal[:, :, self.hierarchy.parent_index, :]
+        else:
+            points_proposal = points_proposal.mean(dim=2, keepdim=True)
         new_points = points_proposal + points_delta
         return encode_points(new_points, self.pc_range)
 
-    def forward(self, query_points, query_feat, mlvl_feats, occ2img, img_metas):
+    def forward(self, query_points, query_feat, node_feat, mlvl_feats, occ2img, img_metas):
         """
         query_points: [B, Q, 3] [x, y, z]
         """
@@ -286,13 +323,14 @@ class GUSDTransformerDecoderLayer(BaseModule):
         query_feat = self.norm2(self.self_attn(query_points, query_feat))
         query_feat = self.norm3(self.ffn(query_feat))
 
+        group_out, node_feat = self.hierarchy(query_feat, node_feat)
         B, Q = query_points.shape[:2]
-        reg_offset = self.scale * self.reg_branch(query_feat)
+        reg_offset = self.scale * slot_forward(self.reg_branch, node_feat, 3)
         refine_pt = self.refine_points(query_points, reg_offset)
 
         cls_score = None
         if self.training or self.last_layer or self.output_all_gs:
-            raw_output = self.cls_branch(query_feat)  # (B, Q, (8+C)*R)
+            raw_output = slot_forward(self.cls_branch, node_feat, self.ga_geom_dim + self.num_classes)
             raw_output = raw_output.reshape(B, Q, self.num_refines, self.ga_geom_dim + self.num_classes)
             gs_params = raw_output[..., :self.ga_geom_dim]   # (B, Q, R, 8)
             semantics = raw_output[..., self.ga_geom_dim:]   # (B, Q, R, C)
@@ -303,9 +341,9 @@ class GUSDTransformerDecoderLayer(BaseModule):
             if (not self.last_layer) and self.gs_param_encoder is not None:
                 gs_flatten = torch.cat([gs_params, semantics], dim=-1).flatten(2, 3)  # (B, Q, R*(8+C))
                 gs_feat = self.gs_param_encoder(gs_flatten.detach())
-                query_feat = query_feat + gs_feat
+                group_out = group_out + gs_feat
 
-        return query_feat, cls_score, refine_pt
+        return group_out, node_feat, cls_score, refine_pt
 
 
 class GUSDSelfAttention(BaseModule):

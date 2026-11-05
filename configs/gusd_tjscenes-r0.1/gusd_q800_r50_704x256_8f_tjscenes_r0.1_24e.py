@@ -92,7 +92,7 @@ model = dict(
         transformer=dict(
             type='GUSDTransformer',
             # Gaussian Parameter Encoder
-            use_gs_param_encoder=True,
+            use_gs_param_encoder=False,
             
             embed_dims=embed_dims,
             num_frames=num_frames,
