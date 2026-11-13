@@ -493,8 +493,9 @@ class GUSDHead(BaseModule):
     # Loss 计算
     # ========================================================================
 
-    def loss_pts_single(self, refine_pts, gt_points_list, gt_masks_list, gt_labels_list):
-        """仅计算 Chamfer distance loss。"""
+    def loss_pts_single(self, refine_pts, gt_points_list, gt_masks_list, gt_labels_list,
+                        use_dcd=False):
+        """Point loss, optionally using OPUS-V2's inverse-frequency weighting."""
         num_imgs = refine_pts.size(0)  # B
         refine_pts = refine_pts.reshape(num_imgs, -1, 3)
         refine_pts = decode_points(refine_pts, self.pc_range)
@@ -517,14 +518,42 @@ class GUSDHead(BaseModule):
         pred_pts = torch.cat(refine_pts_list)
         pred_paired_pts = torch.cat(pred_paired_pts)
 
+        if use_dcd:
+            # The OPUS DCD head normalizes each direction by the sum of inverse
+            # assignment counts, computed independently for each batch item.
+            exponent = float(self.train_cfg.get('dcd_frequency_power', 1.0))
+            if not 0.0 <= exponent <= 1.0:
+                raise ValueError('dcd_frequency_power must be in [0, 1]')
+            with torch.no_grad():
+                gt_inv_counts, pred_inv_counts = [], []
+                for gt_idx, pred_idx, pred, gt in zip(
+                        gt_paired_idx_list, pred_paired_idx_list,
+                        refine_pts_list, gt_points_list):
+                    gt_idx, pred_idx = gt_idx.reshape(-1), pred_idx.reshape(-1)
+                    gt_counts = torch.bincount(gt_idx, minlength=pred.shape[0])
+                    pred_counts = torch.bincount(pred_idx, minlength=gt.shape[0])
+                    gt_inv_counts.append(gt_counts[gt_idx].clamp_min(1).float().pow(-exponent))
+                    pred_inv_counts.append(pred_counts[pred_idx].clamp_min(1).float().pow(-exponent))
+                gt_inv_counts = torch.cat(gt_inv_counts)
+                pred_inv_counts = torch.cat(pred_inv_counts)
+            gt_pts_weights = gt_pts_weights * gt_inv_counts
+            pred_pts_weights = pred_inv_counts
+            gt_avg_factor = gt_inv_counts.sum()
+            pred_avg_factor = pred_inv_counts.sum()
+        else:
+            pred_pts_weights = None
+            gt_avg_factor = gt_pts.shape[0]
+            pred_avg_factor = pred_pts.shape[0]
+
         loss_pts = pred_pts.new_tensor(0)
         loss_pts += self.loss_pts(gt_pts,
                                   gt_paired_pts,
                                   weight=gt_pts_weights[..., None],
-                                  avg_factor=gt_pts.shape[0])
+                                  avg_factor=gt_avg_factor)
         loss_pts += self.loss_pts(pred_pts,
                                   pred_paired_pts,
-                                  avg_factor=pred_pts.shape[0])
+                                  weight=pred_pts_weights[..., None] if pred_pts_weights is not None else None,
+                                  avg_factor=pred_avg_factor)
 
         return loss_pts
 
@@ -589,7 +618,7 @@ class GUSDHead(BaseModule):
 
         return loss_gs
     
-    def _select_topk_occupied(self, bin_logits: torch.Tensor):
+    def _select_topk_occupied(self, bin_logits: torch.Tensor, semantics=None):
         """选择占用体素, 两条路径:
 
         注意: self.test_cfg 由 mvx_two_stage 用 test_cfg['pts'] 注入,
@@ -605,6 +634,21 @@ class GUSDHead(BaseModule):
                           (阈值路径下各 batch 的 K_b 可以不同)
         """
         B, _, X, Y, Z = bin_logits.shape
+
+        # Per-class thresholds use the predicted semantic class before the
+        # existing occupancy closing step. They take precedence over score_thr/topk.
+        class_thresholds = self.test_cfg.get('class_score_thresholds', None)
+        if class_thresholds is not None:
+            if semantics is None or semantics.shape != (B, X, Y, Z):
+                raise ValueError('class_score_thresholds require predicted semantics')
+            if len(class_thresholds) != self.num_classes:
+                raise ValueError('class_score_thresholds must have num_classes entries')
+            thresholds = bin_logits.new_tensor(class_thresholds)
+            if not torch.isfinite(thresholds).all() or (thresholds < 0).any() or (thresholds > 1).any():
+                raise ValueError('class_score_thresholds must be finite and within [0, 1]')
+            voxel_thresholds = thresholds[semantics.long()]
+            occupied_masks = bin_logits.squeeze(1) > voxel_thresholds
+            return voxel_thresholds, [mask.nonzero(as_tuple=False) for mask in occupied_masks]
 
         # ---- 路径 1: 分数阈值 ----
         score_thr = self.test_cfg.get('score_thr', None)
@@ -629,7 +673,7 @@ class GUSDHead(BaseModule):
     # 构建 GS loss 输入 (适配 OccupancyLoss / MultiLoss 接口)
     # ========================================================================
 
-    def _build_gs_loss_inputs(self, rendered_occ, gt_dense_occ, mask_camera):
+    def _build_gs_loss_inputs(self, rendered_occ, gt_dense_occ, mask_camera, visible=True):
         """将 dense 格式的渲染结果转为 OccupancyLoss 需要的稀疏格式。
 
         Args:
@@ -641,7 +685,7 @@ class GUSDHead(BaseModule):
             dict: {pred_occ, sampled_xyz, sampled_label, occ_mask}
         """
         gt_nonempty = (gt_dense_occ != self.empty_label)          # (B, X, Y, Z)
-        valid_mask = gt_nonempty & mask_camera.bool()             # camera 内 & 非空
+        valid_mask = gt_nonempty & (mask_camera.bool() if visible else ~mask_camera.bool())
 
         B, C, X, Y, Z = rendered_occ.shape
 
@@ -652,6 +696,8 @@ class GUSDHead(BaseModule):
 
         for b in range(B):
             vm = valid_mask[b]  # (X, Y, Z)
+            if vm.sum() == 0 and not visible:
+                continue
             if vm.sum() == 0:
                 # 用 dummy 避免空 tensor
                 vm[X // 2, Y // 2, Z // 2] = True
@@ -725,22 +771,22 @@ class GUSDHead(BaseModule):
 
         num_dec_layers = len(all_refine_pts)
 
-        # === A. 准备 GT sparse points (用于 loss_pts) ===
-        gt_points_list, gt_masks_list, gt_labels_list = \
-            self.get_sparse_voxels(voxel_semantics, mask_camera)
-        all_gt_points_list = [gt_points_list for _ in range(num_dec_layers)]
-        all_gt_masks_list = [gt_masks_list for _ in range(num_dec_layers)]
-        all_gt_labels_list = [gt_labels_list for _ in range(num_dec_layers)]
-
-        # === B. 计算每层的 loss_pts (Chamfer distance) ===
-        losses_pts = []
-        for i in range(num_dec_layers):
-            loss_pts_i = self.loss_pts_single(
-                all_refine_pts[i],
-                all_gt_points_list[i],
-                all_gt_masks_list[i],
-                all_gt_labels_list[i])
-            losses_pts.append(loss_pts_i)
+        # Disable point matching entirely for the no-CD ablation. Connected
+        # zeros retain DDP graph participation without supervising centers.
+        use_pts_loss = self.train_cfg.get('use_pts_loss', True)
+        dcd_mode = self.train_cfg.get('dcd_mode', 'none')
+        if dcd_mode not in ('none', 'all', 'final'):
+            raise ValueError("dcd_mode must be 'none', 'all' or 'final'")
+        if use_pts_loss:
+            gt_points_list, gt_masks_list, gt_labels_list = \
+                self.get_sparse_voxels(voxel_semantics, mask_camera)
+            losses_pts = []
+            for i in range(num_dec_layers):
+                losses_pts.append(self.loss_pts_single(
+                    all_refine_pts[i], gt_points_list, gt_masks_list, gt_labels_list,
+                    use_dcd=(dcd_mode == 'all' or (dcd_mode == 'final' and i == num_dec_layers - 1))))
+        else:
+            losses_pts = [pts.sum() * 0.0 for pts in all_refine_pts]
 
         # === C. 计算每层的 gs_rendered_loss ===
         losses_gs = []
@@ -750,7 +796,17 @@ class GUSDHead(BaseModule):
             else:
                 inputs = self._build_gs_loss_inputs(
                     all_gs_rendered[i], voxel_semantics, mask_camera)
-                losses_gs.append(self.loss_gs_cls(**inputs))
+                gs_loss = self.loss_gs_cls(**inputs)
+                # Compute the complete semantic loss (CE and Lovasz) separately
+                # for the two populations, then scale the invisible contribution.
+                invisible_weight = float(self.train_cfg.get('invisible_semantic_loss_weight', 0.0))
+                if invisible_weight < 0:
+                    raise ValueError('invisible_semantic_loss_weight must be nonnegative')
+                if invisible_weight and ((voxel_semantics != self.empty_label) & ~mask_camera).any():
+                    invisible_inputs = self._build_gs_loss_inputs(
+                        all_gs_rendered[i], voxel_semantics, mask_camera, visible=False)
+                    gs_loss = gs_loss + invisible_weight * self.loss_gs_cls(**invisible_inputs)
+                losses_gs.append(gs_loss)
 
         # === D. 计算BCE loss（二分类）===
         losses_bin = []
@@ -781,8 +837,12 @@ class GUSDHead(BaseModule):
 
         # init_points loss
         if init_points is not None:
-            init_loss_pts = self.loss_pts_single(
-                init_points, gt_points_list, gt_masks_list, gt_labels_list)
+            if use_pts_loss:
+                init_loss_pts = self.loss_pts_single(
+                    init_points, gt_points_list, gt_masks_list, gt_labels_list,
+                    use_dcd=(dcd_mode == 'all'))
+            else:
+                init_loss_pts = init_points.sum() * 0.0
             loss_dict['init_loss_pts'] = init_loss_pts
 
         # 最后一层（主监督）
@@ -891,7 +951,7 @@ class GUSDHead(BaseModule):
         semantics = rendered_occ.argmax(dim=1)
 
         # 2. TopK / 分数阈值 占用过滤 → 构建 dense occ
-        kth_thresh, occupied_idx = self._select_topk_occupied(bin_logits)
+        kth_thresh, occupied_idx = self._select_topk_occupied(bin_logits, semantics)
         dense_occ = torch.full(
             (batch_size, X, Y, Z), self.empty_label,
             dtype=torch.long, device=rendered_occ.device)
