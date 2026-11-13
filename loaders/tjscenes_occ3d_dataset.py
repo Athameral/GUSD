@@ -214,8 +214,9 @@ class TJScenesOcc3DDataset(NuScenesDataset):
 
         if num_skipped > 0:
             logging.info(f'eval_miou: skipped {num_skipped} samples (offset={offset})')
-        metric.log(metric.compute())
-        return {'mIoU': metric.count_miou()}
+        results = metric.compute()
+        metric.log(results)
+        return results
 
     def eval_riou(self, occ_results, runner=None, show_dir=None, **eval_kwargs):
         # Reserved for future use in TJScenes. Keep this method for API compatibility.

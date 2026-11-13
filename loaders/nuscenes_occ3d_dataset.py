@@ -215,8 +215,9 @@ class NuScenesOcc3DDataset(NuScenesDataset):
             
             metric.add_batch(occ_pred, occ_labels, mask_lidar, mask_camera)
             pbar.set_postfix(mIoU=metric.compute())
-        metric.log(metric.compute())
-        return {'mIoU': metric.count_miou()}
+        results = metric.compute()
+        metric.log(results)
+        return results
     
     # def eval_riou(self, occ_results: Union[Sequence[dict], queue.Queue], runner=None, show_dir=None, **eval_kwargs):
     #     logging.info('Starting Evaluation RayIoU...')

@@ -178,6 +178,13 @@ class MyTensorboardLoggerHook(LoggerHook):
     @master_only
     def before_run(self, runner):
         super(MyTensorboardLoggerHook, self).before_run(runner)
+        # Existing configs set reset_flag on both loggers. The last logger
+        # clears MMCV's existing log buffer after all earlier loggers read it.
+        logger_hooks = [hook for hook in runner.hooks if isinstance(hook, LoggerHook)]
+        for hook in logger_hooks[:-1]:
+            hook.reset_flag = False
+        if logger_hooks:
+            logger_hooks[-1].reset_flag = True
         if self.log_dir is None:
             self.log_dir = runner.work_dir
         self.writer = SummaryWriter(self.log_dir)
@@ -202,11 +209,14 @@ class MyTensorboardLoggerHook(LoggerHook):
                     ignore = True
 
             if key[:3] == 'val':
-                metric_name = key[22:]
-                if metric_name in ['mAP', 'mATE', 'mASE', 'mAOE', 'mAVE', 'mAAE', 'NDS']:
-                    key = 'val/' + metric_name
+                if key in ('val/mIoU', 'val/IoU'):
+                    pass
                 else:
-                    ignore = True
+                    metric_name = key[22:]
+                    if metric_name in ['mAP', 'mATE', 'mASE', 'mAOE', 'mAVE', 'mAAE', 'NDS']:
+                        key = 'val/' + metric_name
+                    else:
+                        ignore = True
 
             if self.get_mode(runner) == 'train' and key[:5] != 'train':
                 ignore = True
