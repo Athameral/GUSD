@@ -8,6 +8,7 @@ from typing import Iterable, Optional, List, Dict, Any, Union
 import logging
 
 import torch
+import torch.nn.functional as F
 
 np.seterr(divide='ignore', invalid='ignore')
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -282,18 +283,22 @@ class Metric_mIoU(BaseMetric):
         )
 
         self._bin_hist: Optional[torch.Tensor] = None
+        # matched predicted, predicted total, matched GT, GT total
+        self._boundary_counts = torch.zeros(4, dtype=torch.float64, device=device)
         if self.compute_binary_iou:
             self._bin_hist = torch.zeros(2, 2, dtype=torch.float64, device=device)
 
     # ---- device management (handle _bin_hist too) ----
     def to(self, device: str) -> 'Metric_mIoU':
         super().to(device)
+        self._boundary_counts = self._boundary_counts.to(device)
         if self._bin_hist is not None:
             self._bin_hist = self._bin_hist.to(device)
         return self
 
     def reset(self) -> None:
         super().reset()
+        self._boundary_counts.zero_()
         if self.compute_binary_iou:
             self._bin_hist = torch.zeros(2, 2, dtype=torch.float64, device=self.device)
 
@@ -348,6 +353,15 @@ class Metric_mIoU(BaseMetric):
         pred = self._as_tensor(pred, device=self.device)
         gt = self._as_tensor(gt, device=self.device)
 
+        valid = torch.ones_like(gt, dtype=torch.bool)
+        selected_mask = (mask_camera if self.mask_mode == 'image' and mask_camera is not None
+                         else mask_lidar if self.mask_mode == 'lidar' and mask_lidar is not None
+                         else mask)
+        if selected_mask is not None:
+            valid &= self._as_tensor(selected_mask, device=self.device).bool()
+        valid &= (gt >= 0) & (gt <= self.free_label)
+        self._update_boundary(pred, gt, valid)
+
         # --- apply mask ---
         if self.mask_mode == 'image' and mask_camera is not None:
             mask_camera = self._as_tensor(mask_camera, device=self.device).bool()
@@ -390,6 +404,37 @@ class Metric_mIoU(BaseMetric):
             bin_gt[bin_gt == fl] = 1
             self._bin_hist += self.hist_info(2, bin_pred, bin_gt)[0]
 
+    def _update_boundary(self, pred, gt, valid):
+        """Accumulate 3D occupied-side boundaries with one-voxel tolerance.
+
+        A boundary voxel is occupied and has a valid free 6-neighbor.
+        Invalid voxels and the outside of the grid do not create boundaries.
+        Matching uses a 3x3x3 neighborhood (Chebyshev distance <= 1).
+        """
+        if gt.ndim != 3 or pred.shape != gt.shape:
+            raise ValueError('Boundary F1 expects matching 3D prediction and GT grids')
+
+        def boundary(occupied):
+            result = torch.zeros_like(valid)
+            for axis in range(3):
+                lo = [slice(None)] * 3
+                hi = [slice(None)] * 3
+                lo[axis], hi[axis] = slice(None, -1), slice(1, None)
+                lo, hi = tuple(lo), tuple(hi)
+                pair = valid[lo] & valid[hi]
+                result[lo] |= pair & occupied[lo] & ~occupied[hi]
+                result[hi] |= pair & occupied[hi] & ~occupied[lo]
+            return result
+
+        pred_boundary = boundary(pred < self.free_label)
+        gt_boundary = boundary(gt < self.free_label)
+        def dilate(x):
+            return F.max_pool3d(x[None, None].float(), 3, stride=1, padding=1)[0, 0].bool()
+        self._boundary_counts += torch.stack((
+            (pred_boundary & dilate(gt_boundary)).sum(), pred_boundary.sum(),
+            (gt_boundary & dilate(pred_boundary)).sum(), gt_boundary.sum(),
+        )).to(torch.float64)
+
     # ---- finalise ----
     def compute(self) -> Dict[str, Any]:
         """Return ``{'mIoU': float}`` (plus ``{'IoU': float}`` if enabled).
@@ -405,6 +450,11 @@ class Metric_mIoU(BaseMetric):
         result = {
             'mIoU': round(vals[~vals.isnan()].mean().item() * 100, 2),
         }
+
+        mp, npred, mg, ngt = self._boundary_counts.tolist()
+        precision = mp / npred if npred else 0.0
+        recall = mg / ngt if ngt else 0.0
+        result['BoundaryF1'] = round(200 * precision * recall / (precision + recall), 2) if precision + recall else 0.0
 
         if self.compute_binary_iou:
             # class 0 = non-free (occupied), class 1 = free (empty)
@@ -437,6 +487,7 @@ class Metric_mIoU(BaseMetric):
         logging.info(f'===> mIoU of {self.cnt} samples: {results["mIoU"]}')
         if 'IoU' in results:
             logging.info(f'===> IoU of {self.cnt} samples: {results["IoU"]}')
+        logging.info(f'===> BoundaryF1 of {self.cnt} samples: {results["BoundaryF1"]}')
 
     # ---- backward-compatible count_miou() ----
     def count_miou(self) -> Union[float, tuple]:

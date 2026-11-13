@@ -178,8 +178,9 @@ class NuScenesOccupancyDataset(NuScenesDataset):
             occ_pred, _ = sparse2dense(result_dict['occ_loc'], result_dict['sem_pred'], voxel_num, 16)
             metric.add_batch(occ_pred, occ_labels, mask)
 
-        mIoU, IoU = metric.count_miou()
-        return {'mIoU': mIoU, 'IoU': IoU}
+        results = metric.compute()
+        metric.log(results)
+        return results
 
     def format_results(self, occ_results, submission_prefix, **kwargs):
         if submission_prefix is not None:
