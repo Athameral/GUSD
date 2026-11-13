@@ -251,7 +251,10 @@ lr_config = dict(
 total_epochs = 24
 batch_size = 8 # bs=1 per gpu
 
-# load pretrained weights
+# Optional initialization from the official OPUS checkpoint
+# for faster convergence and save your wallet.
+# You may also initialize from:
+# cascade_mask_rcnn_r50_fpn_coco-20e_20e_nuim_20201009_124951-40963960.pth
 load_from = 'pretrain_v3/opusv2_s_100e.pth'
 revise_keys = None
 
