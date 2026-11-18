@@ -14,5 +14,6 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("local_aggregate", &LocalAggregateCUDA);
+  m.def("local_aggregate_render", &LocalAggregateRenderCUDA);
   m.def("local_aggregate_backward", &LocalAggregateBackwardCUDA);
 }

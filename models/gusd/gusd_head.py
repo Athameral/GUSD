@@ -10,6 +10,7 @@ from mmdet.models import HEADS
 from mmdet.models.utils import build_transformer
 from mmdet.models.builder import build_loss
 from ..bbox.utils import decode_points, encode_points
+from ..checkpoint import checkpoint
 
 from .localagg_prob_fast import local_aggregate_prob_fast
 
@@ -83,6 +84,9 @@ class GUSDHead(BaseModule):
                  pruning=False,               # 是否启用剪枝
                  prune_scale_thr=0.02,       # max(s_x,s_y,s_z) 低于此值的高斯可能被剪
                  prune_opa_thr=0.01,         # opacity 低于此值的高斯可能被剪
+                 # CUDA math remains FP32; only the large sparse semantic
+                 # result retained until loss construction is stored in FP16.
+                 sparse_semantic_storage_fp16=False,
                  # loss_bin FN (假空) 加权
                  # 默认 None = 不启用 (保持原 reduction='mean' 行为)
                  # 设为正数 (如 20) 后, GT=occupied 但 pred=empty 的体素 BCE 权重 × FN_loss_mult
@@ -117,6 +121,7 @@ class GUSDHead(BaseModule):
         self.pruning = pruning
         self.prune_scale_thr = prune_scale_thr
         self.prune_opa_thr = prune_opa_thr
+        self.sparse_semantic_storage_fp16 = bool(sparse_semantic_storage_fp16)
         self.FN_loss_mult = FN_loss_mult
         self.FN_loss_thresh = FN_loss_thresh
         self.use_replace = use_replace
@@ -310,13 +315,15 @@ class GUSDHead(BaseModule):
         # pt_feats[i]: (gs_params, semantics) tuple 或 None
         # refine_pts[i]: (B, Q, R_i, 3)
 
-        # 生成体素中心 (所有 batch 共享)
-        voxel_centers = self.generate_voxel_centers(1, init_points.device)  # (1, X*Y*Z, 3)
+        # Sparse rendering reconstructs only supported voxel centers.
+        voxel_centers = None if self.aggregator.render_mode == 'sparse_voxel' else \
+            self.generate_voxel_centers(1, init_points.device)
 
         # 对每层进行 Gaussian 渲染
         all_gs_rendered = []
         all_gs_bin_logits = []
         all_gs_density = []
+        all_gs_sparse = []
         all_gs = []
         all_gs_scales = []   # (B, Q, R, 3) decoded scales per layer
         all_gs_opas = []     # (B, Q, R)    decoded opacity per layer
@@ -327,6 +334,7 @@ class GUSDHead(BaseModule):
                 all_gs_rendered.append(None)
                 all_gs_bin_logits.append(None)
                 all_gs_density.append(None)
+                all_gs_sparse.append(None)
                 all_gs.append(None)
                 all_gs_scales.append(None)
                 all_gs_opas.append(None)
@@ -343,6 +351,7 @@ class GUSDHead(BaseModule):
             batch_rendered_sem = []
             batch_bin_logits = []
             batch_density = []
+            batch_sparse_indices = []
             batch_decoded_scales = []  # 收集解码后的 scales
             batch_decoded_opa = []     # 收集解码后的 opacity
             # 可以试试multi_apply等方法并行化
@@ -377,31 +386,59 @@ class GUSDHead(BaseModule):
                         scales = scales[:, idx, :]
                         CovInv = CovInv[:, idx, :, :]
 
-                rendered = self.aggregator(
-                    voxel_centers.clone().float(),
-                    means,
-                    origi_opa,
-                    opacities,
-                    scales,
-                    CovInv
-                )  # → (semantics[1,N,C], bin_logits[1,N], density[1,N])
-                batch_rendered_sem.append(rendered[0])
-                batch_bin_logits.append(rendered[1])
-                batch_density.append(rendered[2])
+                render_pts = None if voxel_centers is None else voxel_centers.clone().float()
+                if self.training and self.train_cfg.get('renderer_checkpoint', False):
+                    # Keep the sparse outputs needed by the loss, but discard
+                    # renderer-private autograd state (binning, probability,
+                    # etc.) until this layer is recomputed during backward.
+                    # The renderer contains no randomness and keeps its
+                    # exponentials/normalization in FP32.
+                    def render_fn(means_, opa_, semantics_, scales_, cov_inv_):
+                        return self.aggregator(
+                            render_pts, means_, opa_, semantics_, scales_,
+                            cov_inv_, self.scene_size)
+                    rendered = checkpoint(
+                        render_fn, means, origi_opa, opacities, scales, CovInv,
+                        use_reentrant=False, preserve_rng_state=False)
+                else:
+                    rendered = self.aggregator(
+                        render_pts, means, origi_opa, opacities, scales,
+                        CovInv, self.scene_size)
+                # → (semantics[1,N,C], bin_logits[1,N], density[1,N])
+                if self.aggregator.render_mode == 'sparse_voxel':
+                    batch_sparse_indices.append(rendered[0])
+                    rendered_semantics = rendered[1]
+                    if self.sparse_semantic_storage_fp16:
+                        rendered_semantics = rendered_semantics.half()
+                    batch_rendered_sem.append(rendered_semantics)
+                    batch_bin_logits.append(rendered[2])
+                    batch_density.append(rendered[3])
+                else:
+                    batch_rendered_sem.append(rendered[0])
+                    batch_bin_logits.append(rendered[1])
+                    batch_density.append(rendered[2])
 
-            rendered_sem = torch.cat(batch_rendered_sem, dim=0)    # (B, N, C)
-            bin_logits = torch.cat(batch_bin_logits, dim=0)        # (B, N)
-            density = torch.cat(batch_density, dim=0)              # (B, N)
-
-            # reshape 为 dense occ 格式
-            X, Y, Z = self.voxel_num.tolist()
-            rendered_sem = rendered_sem.reshape(B, X, Y, Z, self.num_classes).permute(0, 4, 1, 2, 3)  # (B, C, X, Y, Z)
-            bin_logits = bin_logits.reshape(B, 1, X, Y, Z)  # (B, 1, X, Y, Z)
-            density = density.reshape(B, 1, X, Y, Z)
-
-            all_gs_rendered.append(rendered_sem)
-            all_gs_bin_logits.append(bin_logits)
-            all_gs_density.append(density)
+            if self.aggregator.render_mode == 'sparse_voxel':
+                all_gs_rendered.append(None)
+                all_gs_bin_logits.append(None)
+                all_gs_density.append(None)
+                all_gs_sparse.append(dict(
+                    indices=batch_sparse_indices,
+                    semantics=batch_rendered_sem,
+                    occupancy=batch_bin_logits,
+                    density=batch_density))
+            else:
+                rendered_sem = torch.cat(batch_rendered_sem, dim=0)
+                bin_logits = torch.cat(batch_bin_logits, dim=0)
+                density = torch.cat(batch_density, dim=0)
+                X, Y, Z = self.voxel_num.tolist()
+                rendered_sem = rendered_sem.reshape(B, X, Y, Z, self.num_classes).permute(0, 4, 1, 2, 3)
+                bin_logits = bin_logits.reshape(B, 1, X, Y, Z)
+                density = density.reshape(B, 1, X, Y, Z)
+                all_gs_rendered.append(rendered_sem)
+                all_gs_bin_logits.append(bin_logits)
+                all_gs_density.append(density)
+                all_gs_sparse.append(None)
             all_gs.append(gaussians)
 
             # 保存解码后的 scales & opacity (B, Q, R, ...) 供正则化复用
@@ -416,6 +453,7 @@ class GUSDHead(BaseModule):
             all_gs_rendered=all_gs_rendered,
             all_gs_bin_logits=all_gs_bin_logits,
             all_gs_density=all_gs_density,
+            all_gs_sparse=all_gs_sparse,
             all_gs=all_gs,
             all_gs_scales=all_gs_scales,  # list of (B, Q, R, 3) or None — decoded
             all_gs_opas=all_gs_opas,      # list of (B, Q, R)    or None — decoded
@@ -496,6 +534,9 @@ class GUSDHead(BaseModule):
     def loss_pts_single(self, refine_pts, gt_points_list, gt_masks_list, gt_labels_list,
                         use_dcd=False):
         """Point loss, optionally using OPUS-V2's inverse-frequency weighting."""
+        # Preserve the former force_fp32 loss contract without recursively
+        # copying every sparse renderer output at loss entry.
+        refine_pts = refine_pts.float()
         num_imgs = refine_pts.size(0)  # B
         refine_pts = refine_pts.reshape(num_imgs, -1, 3)
         refine_pts = decode_points(refine_pts, self.pc_range)
@@ -748,11 +789,84 @@ class GUSDHead(BaseModule):
         z = (z_idx.float() + 0.5) / Z * self.scene_size[2] + self.pc_range[2]
         return torch.stack([x, y, z], dim=-1)
 
+    def _build_sparse_gs_loss_inputs(self, sparse, gt_dense_occ, mask_camera, visible=True):
+        """Build the same semantic-loss inputs without a dense C-channel grid."""
+        B, X, Y, Z = gt_dense_occ.shape
+        valid_mask = (gt_dense_occ != self.empty_label) & \
+            (mask_camera.bool() if visible else ~mask_camera.bool())
+        pred_occ_list = []
+        sampled_xyz_list = []
+        sampled_label_list = []
+        for b in range(B):
+            linear = valid_mask[b].flatten().nonzero(as_tuple=False).squeeze(1)
+            if linear.numel() == 0 and not visible:
+                continue
+            if linear.numel() == 0:
+                linear = linear.new_tensor([(X // 2 * Y + Y // 2) * Z + Z // 2])
+
+            active_idx = sparse['indices'][b]
+            active_sem = sparse['semantics'][b]
+            fallback = active_sem.new_zeros((linear.numel(), self.num_classes))
+            fallback[:, :self.num_classes - 1] = 1.0 / (self.num_classes - 1)
+            if active_idx.numel():
+                positions = torch.searchsorted(active_idx, linear)
+                safe_positions = positions.clamp(max=active_idx.numel() - 1)
+                matched = (positions < active_idx.numel()) & \
+                    (active_idx[safe_positions] == linear)
+                sem = torch.where(matched[:, None], active_sem[safe_positions], fallback)
+            else:
+                sem = fallback + active_sem.sum() * 0.0
+
+            x = torch.div(linear, Y * Z, rounding_mode='floor')
+            y = torch.div(linear, Z, rounding_mode='floor').remainder(Y)
+            z = linear.remainder(Z)
+            # CE/softmax/Lovasz stay FP32 even when the full sparse semantic
+            # tensor is packed in FP16 between forward and loss construction.
+            pred_occ_list.append(sem.float().t().unsqueeze(0))
+            sampled_xyz_list.append(self._idx_to_world_coords(x, y, z).unsqueeze(0))
+            sampled_label_list.append(gt_dense_occ[b].flatten()[linear].unsqueeze(0))
+
+        pred_occ = [torch.cat(pred_occ_list, dim=-1)] if pred_occ_list else []
+        return dict(
+            pred_occ=pred_occ,
+            sampled_xyz=torch.cat(sampled_xyz_list, dim=1) if sampled_xyz_list else None,
+            sampled_label=torch.cat(sampled_label_list, dim=1) if sampled_label_list else None,
+            occ_mask=None)
+
+    def _sparse_binary_loss(self, sparse, gt_nonempty):
+        """Exact dense BCE decomposition into active and inactive voxels."""
+        eps = 1e-7
+        total_loss = gt_nonempty.new_tensor(0.0)
+        total_voxels = gt_nonempty.numel()
+        inactive_safe = gt_nonempty.new_tensor(eps)
+        inactive_positive_loss = -torch.log(inactive_safe)
+        inactive_negative_loss = -torch.log1p(-inactive_safe)
+        for b, (indices, occupancy) in enumerate(zip(
+                sparse['indices'], sparse['occupancy'])):
+            target = gt_nonempty[b].flatten()[indices]
+            safe = occupancy.clamp(min=eps, max=1 - eps)
+            if self.FN_loss_mult is not None:
+                fn = (target > 0.5) & (safe.detach() < self.FN_loss_thresh)
+                weight = torch.ones_like(target)
+                weight[fn] = self.FN_loss_mult
+                active_loss = F.binary_cross_entropy(
+                    safe, target, weight=weight, reduction='sum')
+                inactive_weight = self.FN_loss_mult if eps < self.FN_loss_thresh else 1.0
+            else:
+                active_loss = F.binary_cross_entropy(safe, target, reduction='sum')
+                inactive_weight = 1.0
+            inactive_positive = gt_nonempty[b].sum() - target.sum()
+            inactive_total = gt_nonempty[b].numel() - indices.numel()
+            inactive_negative = inactive_total - inactive_positive
+            total_loss = total_loss + active_loss + \
+                inactive_positive * inactive_positive_loss * inactive_weight + \
+                inactive_negative * inactive_negative_loss
+        return total_loss / total_voxels
+
     # ========================================================================
     # Loss 方法
     # ========================================================================
 
-    @force_fp32(apply_to=('preds_dicts'))
     def loss(self, voxel_semantics, mask_camera, preds_dicts):
         """计算 loss。
 
@@ -765,6 +879,7 @@ class GUSDHead(BaseModule):
         all_refine_pts = preds_dicts['all_refine_pts']
         all_gs_rendered = preds_dicts['all_gs_rendered']
         all_gs_bin_logits = preds_dicts['all_gs_bin_logits']
+        all_gs_sparse = preds_dicts.get('all_gs_sparse', [None] * len(all_refine_pts))
 
         voxel_semantics = voxel_semantics.long()
         mask_camera = mask_camera.bool()
@@ -791,11 +906,13 @@ class GUSDHead(BaseModule):
         # === C. 计算每层的 gs_rendered_loss ===
         losses_gs = []
         for i in range(num_dec_layers):
-            if all_gs_rendered[i] is None:
+            if all_gs_rendered[i] is None and all_gs_sparse[i] is None:
                 losses_gs.append(torch.tensor(0., device=voxel_semantics.device))
             else:
-                inputs = self._build_gs_loss_inputs(
-                    all_gs_rendered[i], voxel_semantics, mask_camera)
+                build_inputs = self._build_sparse_gs_loss_inputs if all_gs_sparse[i] is not None \
+                    else self._build_gs_loss_inputs
+                prediction = all_gs_sparse[i] if all_gs_sparse[i] is not None else all_gs_rendered[i]
+                inputs = build_inputs(prediction, voxel_semantics, mask_camera)
                 gs_loss = self.loss_gs_cls(**inputs)
                 # Compute the complete semantic loss (CE and Lovasz) separately
                 # for the two populations, then scale the invisible contribution.
@@ -803,8 +920,8 @@ class GUSDHead(BaseModule):
                 if invisible_weight < 0:
                     raise ValueError('invisible_semantic_loss_weight must be nonnegative')
                 if invisible_weight and ((voxel_semantics != self.empty_label) & ~mask_camera).any():
-                    invisible_inputs = self._build_gs_loss_inputs(
-                        all_gs_rendered[i], voxel_semantics, mask_camera, visible=False)
+                    invisible_inputs = build_inputs(
+                        prediction, voxel_semantics, mask_camera, visible=False)
                     gs_loss = gs_loss + invisible_weight * self.loss_gs_cls(**invisible_inputs)
                 losses_gs.append(gs_loss)
 
@@ -812,8 +929,10 @@ class GUSDHead(BaseModule):
         losses_bin = []
         gt_nonempty: torch.Tensor = (voxel_semantics != self.empty_label).float()
         for i in range(num_dec_layers):
-            if all_gs_bin_logits[i] is None:
+            if all_gs_bin_logits[i] is None and all_gs_sparse[i] is None:
                 losses_bin.append(torch.tensor(0., device=voxel_semantics.device))
+            elif all_gs_sparse[i] is not None:
+                losses_bin.append(self._sparse_binary_loss(all_gs_sparse[i], gt_nonempty))
             else:
                 safe_input = all_gs_bin_logits[i].squeeze(1).clamp(min=1e-7, max=1 - 1e-7)
                 if self.FN_loss_mult is not None:
@@ -942,19 +1061,33 @@ class GUSDHead(BaseModule):
         Returns:
             result_list: list of dict {dense_occ: np.ndarray (X, Y, Z)}
         """
-        rendered_occ: torch.Tensor = pred_dicts['all_gs_rendered'][-1]       # (B, C, X, Y, Z)
-        bin_logits: torch.Tensor = pred_dicts['all_gs_bin_logits'][-1]       # (B, 1, X, Y, Z)
-        batch_size = rendered_occ.shape[0]
         X, Y, Z = self.voxel_num.tolist()
-
-        # 1. 语义: argmax → (B, X, Y, Z)
-        semantics = rendered_occ.argmax(dim=1)
+        sparse = pred_dicts.get('all_gs_sparse', [None])[-1]
+        if sparse is not None:
+            batch_size = len(sparse['indices'])
+            device = sparse['semantics'][0].device
+            bin_flat = torch.zeros((batch_size, X * Y * Z), device=device)
+            semantics_flat = torch.zeros(
+                (batch_size, X * Y * Z), dtype=torch.long, device=device)
+            for b in range(batch_size):
+                idx = sparse['indices'][b]
+                bin_flat[b, idx] = sparse['occupancy'][b]
+                semantics_flat[b, idx] = sparse['semantics'][b].argmax(dim=1)
+            bin_logits = bin_flat.reshape(batch_size, 1, X, Y, Z)
+            semantics = semantics_flat.reshape(batch_size, X, Y, Z)
+            output_device = device
+        else:
+            rendered_occ = pred_dicts['all_gs_rendered'][-1]
+            bin_logits = pred_dicts['all_gs_bin_logits'][-1]
+            batch_size = rendered_occ.shape[0]
+            semantics = rendered_occ.argmax(dim=1)
+            output_device = rendered_occ.device
 
         # 2. TopK / 分数阈值 占用过滤 → 构建 dense occ
         kth_thresh, occupied_idx = self._select_topk_occupied(bin_logits, semantics)
         dense_occ = torch.full(
             (batch_size, X, Y, Z), self.empty_label,
-            dtype=torch.long, device=rendered_occ.device)
+            dtype=torch.long, device=output_device)
         for b in range(batch_size):
             idx_b = occupied_idx[b]  # (K, 3) — 阈值路径下各 batch K 可不同
             if idx_b.numel() == 0:

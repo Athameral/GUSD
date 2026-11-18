@@ -39,6 +39,8 @@ namespace LocalAggregator
 	struct ImageState
 	{
 		uint2* ranges;
+		uint32_t* active_tiles;
+		uint32_t* active_count;
 
 		static ImageState fromChunk(char*& chunk, size_t N);
 	};
@@ -46,11 +48,13 @@ namespace LocalAggregator
 	struct BinningState
 	{
 		size_t sorting_size;
+		size_t unique_size;
 		uint32_t* point_list_keys_unsorted;
 		uint32_t* point_list_keys;
 		uint32_t* point_list_unsorted;
 		uint32_t* point_list;
 		char* list_sorting_space;
+		char* unique_space;
 
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};

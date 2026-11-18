@@ -20,6 +20,7 @@
 #include "device_launch_parameters.h"
 #include <cub/cub.cuh>
 #include <cub/device/device_radix_sort.cuh>
+#include <cub/device/device_select.cuh>
 // #define GLM_FORCE_CUDA
 // #include <glm/glm.hpp>
 
@@ -101,8 +102,9 @@ __global__ void identifyTileRanges(
 
 	// Read tile ID from key. Update start/end of tile range if at limit.
 	uint32_t currtile = point_list_keys[idx];
-	if (idx == 0)
+	if (idx == 0) {
 		ranges[currtile].x = 0;
+	}
 	else
 	{
 		uint32_t prevtile = point_list_keys[idx - 1];
@@ -131,6 +133,8 @@ LocalAggregator::ImageState LocalAggregator::ImageState::fromChunk(char*& chunk,
 {
 	ImageState img;
 	obtain(chunk, img.ranges, N, 128);
+	obtain(chunk, img.active_tiles, N, 128);
+	obtain(chunk, img.active_count, 1, 128);
 	return img;
 }
 
@@ -146,6 +150,11 @@ LocalAggregator::BinningState LocalAggregator::BinningState::fromChunk(char*& ch
 		binning.point_list_keys_unsorted, binning.point_list_keys,
 		binning.point_list_unsorted, binning.point_list, P);
 	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
+	cub::DeviceSelect::Unique(
+		nullptr, binning.unique_size,
+		binning.point_list_keys, binning.point_list_keys,
+		static_cast<uint32_t*>(nullptr), P);
+	obtain(chunk, binning.unique_space, binning.unique_size, 128);
 	return binning;
 }
 
@@ -171,7 +180,9 @@ int LocalAggregator::Aggregator::forward(
 	float* out_bin_logits,
 	float* out_density,
 	float* out_probability,
+	bool* support_mask,
 	const int tile_size,
+	const int render_mode,
 	bool debug)
 {
 	size_t chunk_size = required<GeometryState>(P);
@@ -234,6 +245,7 @@ int LocalAggregator::Aggregator::forward(
 		num_rendered, 0, 32 + bit), debug)
 
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_count * sizeof(uint2)), debug);
+	CHECK_CUDA(cudaMemset(imgState.active_count, 0, sizeof(uint32_t)), debug);
 
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
@@ -242,6 +254,20 @@ int LocalAggregator::Aggregator::forward(
 			binningState.point_list_keys,
 			imgState.ranges);
 	CHECK_CUDA(, debug)
+	if (render_mode != 0 && num_rendered > 0) {
+		// The sorted tile keys make DeviceSelect::Unique produce a compact,
+		// strictly increasing active-tile list without a host count readback.
+		CHECK_CUDA(cub::DeviceSelect::Unique(
+			binningState.unique_space, binningState.unique_size,
+			binningState.point_list_keys, imgState.active_tiles,
+			imgState.active_count, num_rendered), debug)
+	}
+	if (render_mode == 2) {
+		CHECK_CUDA(FORWARD::markSupport(grid, imgState.ranges, binningState.point_list,
+			means3D_int, radii, support_mask, imgState.active_tiles,
+			imgState.active_count, tile_size), debug);
+		return num_rendered;
+	}
 
 	// Let each tile blend its range of Gaussians independently in parallel
 	CHECK_CUDA(FORWARD::render(
@@ -261,10 +287,34 @@ int LocalAggregator::Aggregator::forward(
 		out_probability,
 		means3D_int,
 		radii,
-		tile_size), debug);
+		tile_size, render_mode == 1, tile_count, imgState.active_tiles, imgState.active_count), debug);
 	
 	// return num_rendered;
 	return num_rendered;
+}
+
+void LocalAggregator::Aggregator::renderOnly(
+	const int P, const int R, const int N,
+	const int H, const int W, const int D,
+	char* binning_buffer, char* image_buffer,
+	const int64_t* linear_indices,
+	const float* voxel_axes,
+	const float* means3D, const int* means3D_int,
+	const float* opas, const float* semantics,
+	const float* cov3D, const int* radii,
+	float* out_logits, float* out_bin_logits,
+	float* out_density, float* out_probability,
+	const int tile_size, bool debug)
+{
+	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
+	const int tile_count = ((H + tile_size - 1) / tile_size) *
+		((W + tile_size - 1) / tile_size) * ((D + tile_size - 1) / tile_size);
+	ImageState imgState = ImageState::fromChunk(image_buffer, tile_count);
+	CHECK_CUDA(FORWARD::renderSparse(
+		N, linear_indices, voxel_axes, dim3(H, W, D), imgState.ranges,
+		binningState.point_list, means3D, cov3D, opas, semantics,
+		out_logits, out_bin_logits, out_density, out_probability,
+		means3D_int, radii, tile_size), debug);
 }
 
 // Produce necessary gradients for optimization, corresponding
@@ -279,7 +329,11 @@ void LocalAggregator::Aggregator::backward(
 	const int* means3D_int,
 	const int* radii,
 	int* voxel2pts,
+	const uint32_t* support_bits,
+	const int* word_prefix,
 	const float* pts,
+	const int64_t* linear_indices,
+	const float* voxel_axes,
 	const float* means3D,
 	const float* cov3D,
 	const float* opas,
@@ -296,6 +350,8 @@ void LocalAggregator::Aggregator::backward(
 	float* semantics_grad,
 	float* cov3D_grad,
 	const int tile_size,
+	const bool sparse_points,
+	const bool compressed_mapping,
 	bool debug)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
@@ -305,12 +361,13 @@ void LocalAggregator::Aggregator::backward(
 
 	const dim3 grid(H, W, D);
 
-	CHECK_CUDA(BACKWARD::preprocess(
-		N,
-		points_int,
-		grid,
-		voxel2pts
-	), debug)
+	if (compressed_mapping) {
+		// The compact rank map is prepared alongside the sparse forward output.
+	} else if (sparse_points) {
+		CHECK_CUDA(BACKWARD::preprocessLinear(N, linear_indices, voxel2pts), debug)
+	} else {
+		CHECK_CUDA(BACKWARD::preprocess(N, points_int, grid, voxel2pts), debug)
+	}
 
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
@@ -323,7 +380,11 @@ void LocalAggregator::Aggregator::backward(
 		radii,
 		grid,
 		voxel2pts,
+		support_bits,
+		word_prefix,
 		pts,
+		linear_indices,
+		voxel_axes,
 		means3D,
 		cov3D,
 		opas,
@@ -339,5 +400,7 @@ void LocalAggregator::Aggregator::backward(
 		opas_grad,
 		semantics_grad,
 		cov3D_grad,
-		tile_size), debug)
+		tile_size,
+		sparse_points,
+		compressed_mapping), debug)
 }

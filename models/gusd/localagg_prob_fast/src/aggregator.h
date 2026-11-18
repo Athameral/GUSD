@@ -41,7 +41,9 @@ namespace LocalAggregator
 			float* out_bin_logits,
 			float* out_density,
 			float* out_probability,
+			bool* support_mask,
 			const int tile_size,
+			const int render_mode,
 			bool debug = false);
 
 		static void backward(
@@ -54,7 +56,11 @@ namespace LocalAggregator
 			const int* means3D_int,
 			const int* radii,
 			int* voxel2pts,
+			const uint32_t* support_bits,
+			const int* word_prefix,
 			const float* pts,
+			const int64_t* linear_indices,
+			const float* voxel_axes,
 			const float* means3D,
 			const float* cov3D,
 			const float* opas,
@@ -71,7 +77,22 @@ namespace LocalAggregator
 			float* semantics_grad,
 			float* cov3D_grad,
 			const int tile_size,
+			const bool sparse_points,
+			const bool compressed_mapping,
 			bool debug = false);
+
+		static void renderOnly(
+			const int P, const int R, const int N,
+			const int H, const int W, const int D,
+			char* binning_buffer, char* image_buffer,
+			const int64_t* linear_indices,
+			const float* voxel_axes,
+			const float* means3D, const int* means3D_int,
+			const float* opas, const float* semantics,
+			const float* cov3D, const int* radii,
+			float* out_logits, float* out_bin_logits,
+			float* out_density, float* out_probability,
+			const int tile_size, bool debug = false);
 	};
 };
 

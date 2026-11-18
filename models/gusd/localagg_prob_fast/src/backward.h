@@ -28,7 +28,11 @@ namespace BACKWARD
         const int* radii,
         const dim3 grid,
         const int* voxel2pts,
+		const uint32_t* support_bits,
+		const int* word_prefix,
         const float* pts,
+		const int64_t* linear_indices,
+		const float* voxel_axes,
         const float* means3D,
         const float* cov3D,
         const float* opas,
@@ -44,13 +48,30 @@ namespace BACKWARD
         float* opas_grad,
         float* semantics_grad,
         float* cov3D_grad,
-        const int tile_size);
+        const int tile_size,
+		const bool sparse_points,
+		const bool compressed_mapping);
 
 	void preprocess(
         const int N,
         const int* points_xyz,
         const dim3 grid,
         int* voxel2pts);
+
+	void preprocessLinear(
+		const int N,
+		const int64_t* linear_indices,
+		int* voxel2pts);
+
+	void markSupportBits(
+		const int N,
+		const int64_t* linear_indices,
+		uint32_t* support_bits);
+
+	void countSupportBits(
+		const int word_count,
+		const uint32_t* support_bits,
+		int* word_counts);
 }
 
 #endif

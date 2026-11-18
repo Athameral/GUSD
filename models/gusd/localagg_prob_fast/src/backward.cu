@@ -19,8 +19,40 @@ __global__ void preprocessCUDA(
 	voxel2pts[voxel_idx] = idx;
 }
 
+__global__ void preprocessLinearCUDA(
+	const int N,
+	const int64_t* linear_indices,
+	int* voxel2pts)
+{
+	const int idx = cg::this_grid().thread_rank();
+	if (idx < N)
+		voxel2pts[linear_indices[idx]] = idx;
+}
 
-template <uint32_t CHANNELS, int TILE_SIZE>
+__global__ void markSupportBitsCUDA(
+	const int N,
+	const int64_t* linear_indices,
+	uint32_t* support_bits)
+{
+	const int idx = cg::this_grid().thread_rank();
+	if (idx < N) {
+		const int64_t linear = linear_indices[idx];
+		atomicOr(support_bits + linear / 32, 1u << (linear % 32));
+	}
+}
+
+__global__ void countSupportBitsCUDA(
+	const int word_count,
+	const uint32_t* support_bits,
+	int* word_counts)
+{
+	const int idx = cg::this_grid().thread_rank();
+	if (idx < word_count)
+		word_counts[idx] = __popc(support_bits[idx]);
+}
+
+
+template <uint32_t CHANNELS, int TILE_SIZE, bool LINEAR_POINTS, bool COMPRESSED_MAPPING>
 __global__ void renderCUDA(
 	const int P,
 	const uint32_t* __restrict__ offsets,
@@ -29,7 +61,11 @@ __global__ void renderCUDA(
 	const int* __restrict__ radii,
 	const dim3 grid,
 	const int* __restrict__ voxel2pts,
+	const uint32_t* __restrict__ support_bits,
+	const int* __restrict__ word_prefix,
 	const float* __restrict__ pts,
+	const int64_t* __restrict__ linear_indices,
+	const float* __restrict__ voxel_axes,
 	const float* __restrict__ means3D,
 	const float* __restrict__ cov3D,
 	const float* __restrict__ opas,
@@ -91,10 +127,36 @@ __global__ void renderCUDA(
 				vz < means_int[3 * idx + 2] - radii[3 * idx + 2] || vz > means_int[3 * idx + 2] + radii[3 * idx + 2])
 				continue;
 			int voxel_idx = vx * grid.y * grid.z + vy * grid.z + vz;
-			int pts_idx = voxel2pts[voxel_idx];
+			int pts_idx;
+			if (COMPRESSED_MAPPING) {
+				const int word = voxel_idx / 32;
+				const int bit = voxel_idx % 32;
+				const uint32_t value = support_bits[word];
+				if (!(value & (1u << bit))) {
+					pts_idx = -1;
+				} else {
+					const int before = word == 0 ? 0 : word_prefix[word - 1];
+					const uint32_t lower = bit == 0 ? 0u : value & ((1u << bit) - 1u);
+					pts_idx = before + __popc(lower);
+				}
+			} else {
+				pts_idx = voxel2pts[voxel_idx];
+			}
 			if (pts_idx >= 0)
 		{
-			float3 d = {means.x - pts[pts_idx * 3], means.y - pts[pts_idx * 3 + 1], means.z - pts[pts_idx * 3 + 2]};
+			float3 point;
+			if (LINEAR_POINTS) {
+				const int64_t linear = linear_indices[pts_idx];
+				const int px = linear / (int64_t(grid.y) * grid.z);
+				const int py = (linear / grid.z) % grid.y;
+				const int pz = linear % grid.z;
+				point.x = voxel_axes[px];
+				point.y = voxel_axes[grid.x + py];
+				point.z = voxel_axes[grid.x + grid.y + pz];
+			} else {
+				point = {pts[pts_idx * 3], pts[pts_idx * 3 + 1], pts[pts_idx * 3 + 2]};
+			}
+			float3 d = {means.x - point.x, means.y - point.y, means.z - point.z};
 			float power = cov1.x * d.x * d.x + cov1.y * d.y * d.y + cov1.z * d.z * d.z;
 			power = -0.5f * power - (cov2.x * d.x * d.y + cov2.y * d.y * d.z + cov2.z * d.x * d.z);
 			power = exp(power);
@@ -170,7 +232,11 @@ void BACKWARD::render(
 	const int* radii,
 	const dim3 grid,
 	const int* voxel2pts,
+	const uint32_t* support_bits,
+	const int* word_prefix,
 	const float* pts,
+	const int64_t* linear_indices,
+	const float* voxel_axes,
 	const float* means3D,
 	const float* cov3D,
 	const float* opas,
@@ -186,15 +252,41 @@ void BACKWARD::render(
 	float* opas_grad,
 	float* semantics_grad,
 	float* cov3D_grad,
-	const int tile_size)
+	const int tile_size,
+	const bool sparse_points,
+	const bool compressed_mapping)
 {
-	#define LAUNCH_BACKWARD(TILE) renderCUDA<NUM_LOGITS_CHANNELS, TILE> <<< P, 128 >>> (P, offsets, point_list_keys_unsorted, means_int, radii, grid, voxel2pts, pts, means3D, cov3D, opas, semantic, logits, bin_logits, density, probability, logits_grad, bin_logits_grad, density_grad, means3D_grad, opas_grad, semantics_grad, cov3D_grad)
+	#define LAUNCH_BACKWARD(TILE) do { if (compressed_mapping) renderCUDA<NUM_LOGITS_CHANNELS, TILE, true, true> <<< P, 128 >>> (P, offsets, point_list_keys_unsorted, means_int, radii, grid, nullptr, support_bits, word_prefix, nullptr, linear_indices, voxel_axes, means3D, cov3D, opas, semantic, logits, bin_logits, density, probability, logits_grad, bin_logits_grad, density_grad, means3D_grad, opas_grad, semantics_grad, cov3D_grad); else if (sparse_points) renderCUDA<NUM_LOGITS_CHANNELS, TILE, true, false> <<< P, 128 >>> (P, offsets, point_list_keys_unsorted, means_int, radii, grid, voxel2pts, nullptr, nullptr, nullptr, linear_indices, voxel_axes, means3D, cov3D, opas, semantic, logits, bin_logits, density, probability, logits_grad, bin_logits_grad, density_grad, means3D_grad, opas_grad, semantics_grad, cov3D_grad); else renderCUDA<NUM_LOGITS_CHANNELS, TILE, false, false> <<< P, 128 >>> (P, offsets, point_list_keys_unsorted, means_int, radii, grid, voxel2pts, nullptr, nullptr, pts, nullptr, nullptr, means3D, cov3D, opas, semantic, logits, bin_logits, density, probability, logits_grad, bin_logits_grad, density_grad, means3D_grad, opas_grad, semantics_grad, cov3D_grad); } while (0)
 	switch (tile_size) {
 		case 2: LAUNCH_BACKWARD(2); break;
 		case 4: LAUNCH_BACKWARD(4); break;
 		case 8: LAUNCH_BACKWARD(8); break;
 	}
 	#undef LAUNCH_BACKWARD
+}
+
+void BACKWARD::preprocessLinear(
+	const int N,
+	const int64_t* linear_indices,
+	int* voxel2pts)
+{
+	preprocessLinearCUDA<<<(N + 255) / 256, 256>>>(N, linear_indices, voxel2pts);
+}
+
+void BACKWARD::markSupportBits(
+	const int N,
+	const int64_t* linear_indices,
+	uint32_t* support_bits)
+{
+	markSupportBitsCUDA<<<(N + 255) / 256, 256>>>(N, linear_indices, support_bits);
+}
+
+void BACKWARD::countSupportBits(
+	const int word_count,
+	const uint32_t* support_bits,
+	int* word_counts)
+{
+	countSupportBitsCUDA<<<(word_count + 255) / 256, 256>>>(word_count, support_bits, word_counts);
 }
 
 void BACKWARD::preprocess(
